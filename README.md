@@ -22,7 +22,7 @@ Plus **snippets**: say a cue ("my email") → it expands to canned text, instant
 Open-source dictation tools stop at raw transcription. Signet adds the **cleanup + AI command layer** that makes tools like Wispr Flow feel magic — and it's **free, unlimited, and 100% local**. Wispr gates unlimited words and AI commands behind a subscription; Signet gives them away because there's no metering.
 
 - **STT:** NVIDIA **Parakeet V3** (int8, ONNX, CPU-optimized) via a tiny warm server — ~3x real-time, excellent accuracy, automatic language detection. whisper.cpp `base.en` is a built-in fallback (`STT_ENGINE=whisper`).
-- **Brain:** Gemma 4 `e2b` via Ollama — cleanup, commands, translation; warm-on-keypress
+- **Brain:** Gemma 4 `e2b` via Ollama — auto-cleanup (fillers, **grammar fix**, punctuation, **number/date formatting**, **auto-bullets when listing**), commands, translation; warm-on-keypress
 - **Injection:** Ctrl+V for browsers (WhatsApp Web), direct typing for terminals/native; **saves & restores your clipboard**
 - **~3s fast mode / ~6s with full polish**, fully on-device. Subtle sound cues. Graceful when Ollama is down.
 

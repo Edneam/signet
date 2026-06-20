@@ -20,6 +20,9 @@ CLEANWAV="$RUNTIME_DIR/rec_clean.wav"
 PIDFILE="$RUNTIME_DIR/rec.pid"
 MODEFILE="$RUNTIME_DIR/mode"
 CLIPBAK="$RUNTIME_DIR/clip.bak"
+HIST="$STATE_DIR/history"
+LAST="$RUNTIME_DIR/last_insert"      # {epoch}\n{text} of the last inserted dictation (for undo)
+UNDO_WINDOW=15                       # seconds after a dictation that Super+Backspace will undo it
 mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$DATA_DIR/models" "$RUNTIME_DIR" 2>/dev/null
 
 # ---------- defaults (override in $CONFIG) ----------
@@ -36,13 +39,16 @@ ON_OLLAMA_DOWN="warn-raw"      # warn-raw | abort
 CLEANUP=1                      # 1 = Gemma polish ; 0 = fast (whisper only)
 THREADS=8
 WTYPE_DELAY=12                 # ms between keystrokes when typing directly (fixes dropped/doubled chars)
-TONE="auto"                    # auto | none | email | slack | code | casual | formal
+TONE="auto"                    # legacy alias for MODE
+MODE="auto"                    # auto | default | email | message | code | notes | formal
 TARGET_LANG="English"          # translation mode target
 STT_ENGINE="parakeet"          # parakeet (fast, warm server) | whisper (whisper.cpp)
 ASR_PYTHON="$DATA_DIR/asr/bin/python"      # venv python for the Parakeet server
 ASR_MODEL_DIR="$DATA_DIR/models/parakeet-v3"
 ASR_PORT=8126
 [ -f "$CONFIG" ] && . "$CONFIG"
+# back-compat: honor old TONE setting if MODE wasn't customized
+[ "${MODE:-auto}" = auto ] && [ "${TONE:-auto}" != auto ] && MODE="$TONE"
 # resolve the Parakeet server script next to this binary (repo or /usr/bin)
 ASR_SERVER="$(dirname "$(readlink -f "$0")")/signet-asr"
 
@@ -86,22 +92,24 @@ gemma_chat(){
     | jq -r '.message.content // empty' | sed 's/^ *//; s/ *$//'
 }
 
-tone_hint(){
-  local t="$TONE" cls
-  if [ "$t" = auto ]; then
+mode_hint(){ # per-context guidance appended to the cleanup prompt; auto from active window
+  local m="$MODE" cls
+  if [ "$m" = auto ]; then
     cls=$(hyprctl activewindow -j 2>/dev/null | jq -r '.class // empty' | tr '[:upper:]' '[:lower:]')
     case "$cls" in
-      *mail*|*thunderbird*|*gmail*) t=email ;;
-      *slack*|*discord*|*telegram*|*whats*) t=casual ;;
-      *code*|*term*|*kitty*|*foot*|*ghostty*|*alacritty*|*nvim*|*vim*) t=code ;;
-      *) t=none ;;
+      *mail*|*thunderbird*|*gmail*) m=email ;;
+      *slack*|*discord*|*telegram*|*whats*|*signal*) m=message ;;
+      *code*|*term*|*kitty*|*foot*|*ghostty*|*alacritty*|*wezterm*|*nvim*|*vim*) m=code ;;
+      *obsidian*|*notes*|*logseq*|*zettlr*) m=notes ;;
+      *) m=default ;;
     esac
   fi
-  case "$t" in
-    email)  echo " Use a clear, professional email tone." ;;
-    slack|casual) echo " Use a casual, friendly tone." ;;
-    code)   echo " Keep it terse and technical." ;;
-    formal) echo " Use a formal tone." ;;
+  case "$m" in
+    email)   echo " Context: an email — clear, professional tone; keep greetings/sign-offs." ;;
+    message) echo " Context: a chat message — natural, casual tone." ;;
+    code)    echo " Context: a terminal/code editor — terse and literal; do NOT use bullet points; keep commands/code verbatim." ;;
+    notes)   echo " Context: notes — use bullet points and structure freely where it helps." ;;
+    formal)  echo " Use a formal tone." ;;
     *) echo "" ;;
   esac
 }
@@ -193,13 +201,19 @@ do_dictate(){
   if [ "$CLEANUP" != 1 ]; then clean="$raw"; log "fast mode"
   elif ollama_up; then
     local names sys; [ -f "$DICT" ] && names=$(grep -vE '^\s*$|^#' "$DICT" | paste -sd ', ')
-    sys="Clean up dictated speech: remove fillers (um, uh, like, you know) and repeated/false-start words, and add correct punctuation and capitalization. Keep ALL of the user's real words — do not summarize, drop phrases, reword, translate, or explain. Output ONLY the cleaned text.$(tone_hint)"
+    sys="Clean up dictated speech. Always: remove fillers (um, uh, like, you know) and false starts/repeated words; fix grammar; add correct capitalization and punctuation; write numbers, dates, times and money normally (e.g. 'three pm' -> '3 PM', 'twenty dollars' -> '\$20', 'june twenty' -> 'June 20'). If the speech is a list of items, format it as a bullet list using '- '. If it is normal prose, keep it as prose. Keep ALL the user's real words and meaning — never summarize, drop content, translate, or explain. Output ONLY the cleaned text.$(mode_hint)"
     [ -n "${names:-}" ] && sys="$sys If a word closely matches one of these names/terms phonetically, fix it to this exact spelling: $names."
     clean=$(curl -s --max-time 60 "$OLLAMA/api/chat" -d "$(jq -n --arg m "$GEMMA" --arg k "$KEEP_ALIVE" --arg s "$sys" --arg u "$raw" \
       '{model:$m,think:false,stream:false,keep_alive:$k,options:{temperature:0,num_predict:400,stop:["\nInput:","Input:"]},
         messages:[{role:"system",content:$s},
-          {role:"user",content:"and so um my fellow americans ask not what your country can do for you you know ask what you can do for your country"},
-          {role:"assistant",content:"And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country."},
+          {role:"user",content:"um i has went to the store yesterday and buyed some stuff you know"},
+          {role:"assistant",content:"I went to the store yesterday and bought some stuff."},
+          {role:"user",content:"things to buy milk eggs bread and coffee"},
+          {role:"assistant",content:"Things to buy:\n- milk\n- eggs\n- bread\n- coffee"},
+          {role:"user",content:"so i was thinking we could maybe meet tomorrow and discuss the project"},
+          {role:"assistant",content:"I was thinking we could meet tomorrow and discuss the project."},
+          {role:"user",content:"the meeting is at three pm on june twenty and it costs twenty dollars"},
+          {role:"assistant",content:"The meeting is at 3 PM on June 20, and it costs $20."},
           {role:"user",content:$u}]}')" \
       | jq -r '.message.content // empty' | sed 's/^ *//; s/ *$//')
   else
@@ -262,8 +276,14 @@ emit(){
   case "$PASTE_MODE" in
     stdout)    printf '%s\n' "$1" ;;
     clipboard) printf '%s' "$1" | wl-copy; log "clipboard" ;;
-    *)         paste_text "$1" ;;
+    *)         paste_text "$1"; record_insert "$1" ;;
   esac
+}
+record_insert(){ # remember the last inserted text for undo + append to history
+  printf '%s\n%s' "$(date +%s)" "$1" > "$LAST"
+  printf '%s\t%s\n' "$(date '+%F %T')" "$1" >> "$HIST"
+  # trim history to last 20 lines
+  [ -f "$HIST" ] && tail -n 20 "$HIST" > "$HIST.tmp" 2>/dev/null && mv "$HIST.tmp" "$HIST"
 }
 paste_text(){
   local text="$1"
@@ -286,6 +306,25 @@ paste_text(){
 cmd_toggle(){
   if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then exec "$0" stop; else exec "$0" start "${1:-dictate}"; fi
 }
+cmd_cancel(){ # kill an in-progress recording without transcribing
+  [ -f "$PIDFILE" ] || return 1
+  local rec; rec=$(cat "$PIDFILE"); rm -f "$PIDFILE" "$MODEFILE"
+  kill -INT "$rec" 2>/dev/null; rm -f "$WAV"
+  log "CANCELLED recording"; notify "✖ Cancelled"; return 0
+}
+cmd_undo(){ # Super+Backspace: cancel if recording, else undo last dictation (single-level, freshness-gated)
+  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then cmd_cancel; return; fi
+  [ -f "$LAST" ] || exit 0
+  local ts text now; ts=$(head -1 "$LAST"); text=$(tail -n +2 "$LAST"); now=$(date +%s)
+  [ -z "$ts" ] && exit 0
+  if [ $(( now - ts )) -gt "$UNDO_WINDOW" ]; then log "undo: too old, ignoring"; exit 0; fi
+  local n=${#text}; [ "$n" -gt 0 ] || exit 0
+  log "UNDO: removing $n chars"
+  local args=(); local i=0; while [ "$i" -lt "$n" ]; do args+=(-k BackSpace); i=$((i+1)); done
+  wtype "${args[@]}" 2>>"$LOG"
+  rm -f "$LAST"; notify "↩ Undone" "${text:0:40}"
+}
+cmd_history(){ [ -f "$HIST" ] && tail -n "${1:-10}" "$HIST" || echo "(no history)"; }
 cmd_warm(){
   [ "$STT_ENGINE" = parakeet ] && { asr_ensure && echo "parakeet warm" || echo "parakeet warm failed"; }
   curl -s --max-time 90 "$OLLAMA/api/generate" -d "$(jq -n --arg m "$GEMMA" --arg k "$KEEP_ALIVE" '{model:$m,prompt:"hi",stream:false,think:false,keep_alive:$k}')" >/dev/null 2>&1 && echo "warmed $GEMMA" || echo "gemma warm failed"
@@ -336,8 +375,9 @@ Add to ~/.config/hypr/hyprland.conf:
   bindr = , F10, exec, $bin stop
   bind  = , F11, exec, $bin start translate    # speak any language -> $TARGET_LANG
   bindr = , F11, exec, $bin stop
+  bind  = SUPER, BackSpace, exec, $bin undo     # cancel recording, or undo last dictation
 
-Hold F9 dictate · F10 command (on selected text) · F11 translate.
+Hold F9 dictate · F10 command (on selected text) · F11 translate · Super+Backspace cancel/undo.
 Parakeet STT: if not installed, see README (uv venv + onnx-asr + model download).
 EOF
 }
@@ -352,7 +392,7 @@ KEEP_ALIVE="30m"          # keep Gemma warm (memory vs cold-reload speed); "-1" 
 LANG_CODE="en"
 PASTE_MODE="auto"         # auto | paste | clipboard | stdout
 CLEANUP=1                 # 1 = Gemma polish ; 0 = fast (whisper/parakeet only, ~half time)
-TONE="auto"               # auto | none | email | slack | code | casual | formal
+MODE="auto"               # auto (pick from active window) | default | email | message | code | notes | formal
 TARGET_LANG="English"     # translate mode target
 SOUND=1
 WTYPE_DELAY=12            # ms between keys when typing directly
@@ -363,7 +403,7 @@ EOF
 }
 cmd_status(){
   echo "signet v$VERSION"; echo "whisper: $WHISPER"; echo "model:   ${MODEL:-<none>}"
-  echo "gemma:   $GEMMA (keep_alive=$KEEP_ALIVE)  cleanup:$CLEANUP  tone:$TONE"
+  echo "gemma:   $GEMMA (keep_alive=$KEEP_ALIVE)  cleanup:$CLEANUP  mode:$MODE"
   echo "paste:   $PASTE_MODE  sound:$SOUND  typedelay:$WTYPE_DELAY  lang:$LANG_CODE  target:$TARGET_LANG"
   echo "recording:$([ -f "$PIDFILE" ] && echo ' active' || echo ' idle')"
   echo "--- log ---"; tail -n 8 "$LOG" 2>/dev/null
@@ -374,6 +414,8 @@ usage: signet <command>
   start [dictate|command|translate]   begin recording (bind to key press)
   stop                                stop + process (bind to key release)
   toggle [mode]                       start/stop on one tap
+  undo                                cancel recording, or undo the last dictation
+  history [n]                         show recent dictations
   warm | setup | doctor | status | config | version
 modes: dictate (clean+type) · command (edit selected text by voice) · translate (-> \$TARGET_LANG)
 EOF
@@ -382,6 +424,9 @@ case "${1:-}" in
   start) cmd_start "${2:-dictate}" ;;
   stop) cmd_stop ;;
   toggle) cmd_toggle "${2:-dictate}" ;;
+  undo) cmd_undo ;;
+  cancel) cmd_cancel ;;
+  history) cmd_history "${2:-10}" ;;
   warm) cmd_warm ;;
   setup) cmd_setup ;;
   doctor) cmd_doctor ;;
