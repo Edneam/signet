@@ -201,15 +201,15 @@ do_dictate(){
   if [ "$CLEANUP" != 1 ]; then clean="$raw"; log "fast mode"
   elif ollama_up; then
     local names sys; [ -f "$DICT" ] && names=$(grep -vE '^\s*$|^#' "$DICT" | paste -sd ', ')
-    sys="Clean up dictated speech. Always: remove fillers (um, uh, like, you know) and false starts/repeated words; fix grammar; add correct capitalization and punctuation; write numbers, dates, times and money normally (e.g. 'three pm' -> '3 PM', 'twenty dollars' -> '\$20', 'june twenty' -> 'June 20'). If the speech enumerates three or more items, tasks, or steps — even when phrased as a sentence with 'and' — format them as a bullet list with '- ', keeping any lead-in phrase as a heading line. Keep a single flowing thought (not an enumeration) as prose. Keep ALL the user's real words and meaning — never summarize, drop content, translate, or explain. Output ONLY the cleaned text.$(mode_hint)"
+    sys="Clean up dictated speech. Always: remove fillers (um, uh, like, you know) and false starts/repeated words; fix grammar; add correct capitalization and punctuation; write numbers, dates, times and money normally (e.g. 'three pm' -> '3 PM', 'twenty dollars' -> '\$20', 'june twenty' -> 'June 20'). If the speech enumerates three or more items, tasks, or steps — even when phrased as a sentence with 'and' — format them as a bullet list with '- ', keeping any lead-in phrase as a heading line. If a trailing remark (such as a time, date, or note) follows the items, put it on its own line after the list, not attached to the last item. Keep a single flowing thought (not an enumeration) as prose. Keep ALL the user's real words and meaning — never summarize, drop content, translate, or explain. Output ONLY the cleaned text.$(mode_hint)"
     [ -n "${names:-}" ] && sys="$sys If a word closely matches one of these names/terms phonetically, fix it to this exact spelling: $names."
     clean=$(curl -s --max-time 60 "$OLLAMA/api/chat" -d "$(jq -n --arg m "$GEMMA" --arg k "$KEEP_ALIVE" --arg s "$sys" --arg u "$raw" \
       '{model:$m,think:false,stream:false,keep_alive:$k,options:{temperature:0,num_predict:400,stop:["\nInput:","Input:"]},
         messages:[{role:"system",content:$s},
           {role:"user",content:"um i has went to the store yesterday and buyed some stuff you know"},
           {role:"assistant",content:"I went to the store yesterday and bought some stuff."},
-          {role:"user",content:"i need to buy milk eggs bread and coffee"},
-          {role:"assistant",content:"I need to buy:\n- milk\n- eggs\n- bread\n- coffee"},
+          {role:"user",content:"i need to buy milk eggs bread and coffee tomorrow"},
+          {role:"assistant",content:"I need to buy:\n- milk\n- eggs\n- bread\n- coffee\n\ntomorrow"},
           {role:"user",content:"remember to call the bank pay rent and email john"},
           {role:"assistant",content:"Remember to:\n- call the bank\n- pay rent\n- email John"},
           {role:"user",content:"so i was thinking we could maybe meet tomorrow and discuss the project"},
