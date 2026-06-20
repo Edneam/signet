@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# signet — local, private voice dictation + AI commands for Hyprland.
+# Speak, get clean text anywhere. whisper.cpp + Gemma, fully on-device.
+set -uo pipefail
+
+VERSION="0.2.0"
+APP="signet"
+
+# ---------- XDG paths ----------
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/$APP"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/$APP"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/$APP"
+CONFIG="$CONFIG_DIR/config"
+DICT="$CONFIG_DIR/dictionary.txt"
+SNIPPETS="$CONFIG_DIR/snippets"
+LOG="$STATE_DIR/signet.log"
+WAV="$RUNTIME_DIR/rec.wav"
+CLEANWAV="$RUNTIME_DIR/rec_clean.wav"
+PIDFILE="$RUNTIME_DIR/rec.pid"
+MODEFILE="$RUNTIME_DIR/mode"
+CLIPBAK="$RUNTIME_DIR/clip.bak"
+mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$DATA_DIR/models" "$RUNTIME_DIR" 2>/dev/null
+
+# ---------- defaults (override in $CONFIG) ----------
+MODEL=""                       # auto-detected if empty
+WHISPER=""                     # auto-detected if empty
+GEMMA="gemma4:e2b"
+OLLAMA="http://localhost:11434"
+KEEP_ALIVE="30m"
+LANG_CODE="en"
+PASTE_MODE="auto"              # auto | paste | clipboard | stdout
+SOUND=1
+MIC="@DEFAULT_AUDIO_SOURCE@"
+ON_OLLAMA_DOWN="warn-raw"      # warn-raw | abort
+CLEANUP=1                      # 1 = Gemma polish ; 0 = fast (whisper only)
+THREADS=8
+WTYPE_DELAY=12                 # ms between keystrokes when typing directly (fixes dropped/doubled chars)
+TONE="auto"                    # auto | none | email | slack | code | casual | formal
+TARGET_LANG="English"          # translation mode target
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+# auto-detect whisper binary
+if [ -z "$WHISPER" ]; then
+  WHISPER=$(command -v whisper-cli 2>/dev/null) || true
+  [ -z "$WHISPER" ] && WHISPER="$HOME/projects/whisper.cpp/build/bin/whisper-cli"
+fi
+# auto-detect model (base.en fast default, then small.en)
+if [ -z "$MODEL" ]; then
+  for m in "$DATA_DIR/models/ggml-base.en.bin" "$HOME/projects/whisper.cpp/models/ggml-base.en.bin" \
+           "$DATA_DIR/models/ggml-small.en.bin" "$HOME/projects/whisper.cpp/models/ggml-small.en.bin"; do
+    [ -f "$m" ] && { MODEL="$m"; break; }
+  done
+fi
+
+# ---------- helpers ----------
+log(){ echo "$(date '+%F %T') $*" >> "$LOG"; }
+notify(){ command -v notify-send >/dev/null && notify-send -u low -t 2000 -a "Signet" "$1" "${2:-}" 2>/dev/null || true; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+blip(){ [ "$SOUND" = 1 ] || return 0; local f="$DATA_DIR/$1.wav"; [ -f "$f" ] && have pw-play && (pw-play --volume 0.4 "$f" >/dev/null 2>&1 &) || true; }
+die(){ notify "⚠️ $1" "${2:-}"; log "ERROR: $1 ${2:-}"; echo "signet: $1" >&2; exit 1; }
+ollama_up(){ curl -s --max-time 2 "$OLLAMA/api/tags" >/dev/null 2>&1; }
+warm_bg(){ ( curl -s --max-time 30 "$OLLAMA/api/generate" -d "$(jq -n --arg m "$GEMMA" --arg k "$KEEP_ALIVE" '{model:$m,prompt:"",stream:false,think:false,keep_alive:$k}')" >/dev/null 2>&1 & ); }
+[ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null||echo 0)" -gt 1048576 ] && mv "$LOG" "$LOG.1"
+
+# call Gemma chat: $1=system $2=user -> stdout (empty on failure)
+gemma_chat(){
+  curl -s --max-time 60 "$OLLAMA/api/chat" -d "$(jq -n --arg m "$GEMMA" --arg k "$KEEP_ALIVE" --arg s "$1" --arg u "$2" \
+    '{model:$m,think:false,stream:false,keep_alive:$k,options:{temperature:0,num_predict:400,stop:["\nInput:","Input:"]},
+      messages:[{role:"system",content:$s},{role:"user",content:$u}]}')" \
+    | jq -r '.message.content // empty' | sed 's/^ *//; s/ *$//'
+}
+
+tone_hint(){
+  local t="$TONE" cls
+  if [ "$t" = auto ]; then
+    cls=$(hyprctl activewindow -j 2>/dev/null | jq -r '.class // empty' | tr '[:upper:]' '[:lower:]')
+    case "$cls" in
+      *mail*|*thunderbird*|*gmail*) t=email ;;
+      *slack*|*discord*|*telegram*|*whats*) t=casual ;;
+      *code*|*term*|*kitty*|*foot*|*ghostty*|*alacritty*|*nvim*|*vim*) t=code ;;
+      *) t=none ;;
+    esac
+  fi
+  case "$t" in
+    email)  echo " Use a clear, professional email tone." ;;
+    slack|casual) echo " Use a casual, friendly tone." ;;
+    code)   echo " Keep it terse and technical." ;;
+    formal) echo " Use a formal tone." ;;
+    *) echo "" ;;
+  esac
+}
+
+# ---------- recording ----------
+cmd_start(){
+  [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null && exit 0
+  have pw-record || die "pw-record not found" "install pipewire"
+  printf '%s' "${1:-dictate}" > "$MODEFILE"
+  log "START (${1:-dictate})"
+  case "${1:-dictate}" in
+    command)   notify "🛠️  Command…" ;;
+    translate) notify "🌐 Translate…" ;;
+    *)         notify "🎤 Recording…" ;;
+  esac
+  blip start
+  warm_bg
+  pw-record --target "$MIC" --rate 16000 --channels 1 "$WAV" &
+  echo $! > "$PIDFILE"
+}
+
+transcribe(){ # $1 = lang ; echoes cleaned RAW transcript
+  local src="$WAV" lang="${1:-$LANG_CODE}" names=""
+  if have ffmpeg; then
+    ffmpeg -y -i "$WAV" -af "highpass=f=100,lowpass=f=8000,silenceremove=start_periods=1:start_duration=0.1:start_threshold=-45dB:detection=peak,areverse,silenceremove=start_periods=1:start_duration=0.1:start_threshold=-45dB:detection=peak,areverse,dynaudnorm=f=200" -ar 16000 -ac 1 "$CLEANWAV" 2>/dev/null && [ -s "$CLEANWAV" ] && src="$CLEANWAV"
+  fi
+  [ -f "$DICT" ] && names=$(grep -vE '^\s*$|^#' "$DICT" | paste -sd ', ')
+  "$WHISPER" -m "$MODEL" -l "$lang" -nt -sns -bo 1 -bs 1 ${names:+--prompt "$names"} -f "$src" -t "$THREADS" 2>/dev/null \
+    | tr '\n' ' ' | sed 's/^ *//; s/ *$//'
+}
+
+is_junk(){ # $1 raw -> 0 if junk/silence hallucination
+  local j; j=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:punct:][:space:]')
+  case "$j" in ""|you|youyou|thankyou|thanks|thanksforwatching|okay|ok|bye|so|uh|um|blankaudio|musicplaying) return 0;; esac
+  return 1
+}
+
+snippet_lookup(){ # $1 raw -> expansion or empty
+  [ -f "$SNIPPETS" ] || return 0
+  local key; key=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:punct:]' | sed 's/^ *//; s/ *$//')
+  awk -F'=' -v k="$key" '
+    /^[[:space:]]*#/ || NF<2 {next}
+    { c=tolower($1); gsub(/^[ \t]+|[ \t]+$/,"",c); gsub(/[[:punct:]]/,"",c);
+      if(c==k){ v=$0; sub(/^[^=]*=/,"",v); gsub(/^[ \t]+/,"",v); print v; exit } }' "$SNIPPETS"
+}
+
+cmd_stop(){
+  [ -f "$PIDFILE" ] || { log "STOP: idle"; exit 0; }
+  local rec mode; rec=$(cat "$PIDFILE"); rm -f "$PIDFILE"
+  mode=$(cat "$MODEFILE" 2>/dev/null || echo dictate)
+  kill -INT "$rec" 2>/dev/null
+  for _ in $(seq 1 20); do kill -0 "$rec" 2>/dev/null || break; sleep 0.05; done
+  blip stop
+  [ -s "$WAV" ] || { notify "No audio"; exit 0; }
+  [ "$(stat -c%s "$WAV")" -lt 12000 ] && { notify "Too short"; log "skip: short"; exit 0; }
+  [ -x "$WHISPER" ] || die "whisper not found" "run: signet doctor"
+  [ -n "$MODEL" ] && [ -f "$MODEL" ] || die "no model" "run: signet setup"
+
+  case "$mode" in
+    command)   do_command ;;
+    translate) do_translate ;;
+    *)         do_dictate ;;
+  esac
+}
+
+do_dictate(){
+  notify "✍️  Transcribing…"
+  local raw; raw=$(transcribe "$LANG_CODE")
+  raw=$(printf '%s' "$raw" | sed -E 's/([[:space:]]+(you|thank you|bye|so|uh|um)){2,}[[:punct:]]*[[:space:]]*$//I' | sed -E 's/[[:space:]]+$//')
+  log "RAW: $raw"
+  [ -z "$raw" ] && { notify "Nothing heard"; exit 0; }
+  is_junk "$raw" && { notify "Nothing heard"; log "skip junk"; exit 0; }
+
+  # snippet expansion (instant, pre-Gemma)
+  local snip; snip=$(snippet_lookup "$raw")
+  if [ -n "$snip" ]; then log "snippet: $raw -> $snip"; emit "$snip"; notify "✂️ Snippet" "$snip"; return; fi
+
+  local clean=""
+  if [ "$CLEANUP" != 1 ]; then clean="$raw"; log "fast mode"
+  elif ollama_up; then
+    local names sys; [ -f "$DICT" ] && names=$(grep -vE '^\s*$|^#' "$DICT" | paste -sd ', ')
+    sys="You clean up dictated speech. Remove fillers (um, uh, like, you know) and false starts/repeated words. Keep the exact meaning, capitalization and punctuation. Never add, reword, translate, or explain. Output ONLY the cleaned text and nothing else.$(tone_hint)"
+    [ -n "${names:-}" ] && sys="$sys Known names/terms — if a word closely matches one phonetically, correct it to this exact spelling: $names."
+    clean=$(gemma_chat "$sys" "$raw")
+  else
+    [ "$ON_OLLAMA_DOWN" = abort ] && die "Ollama not running" "start it: ollama serve"
+    notify "⚠️ Ollama down — raw text"; log "ollama down"
+  fi
+  [ -z "$clean" ] && clean="$raw"
+  log "CLEAN: $clean"
+  emit "$clean"
+  notify "✅ Done" "$clean"
+}
+
+do_translate(){
+  notify "🌐 Translating…"
+  local raw; raw=$(transcribe auto)
+  log "RAW(xl): $raw"
+  [ -z "$raw" ] && { notify "Nothing heard"; exit 0; }
+  is_junk "$raw" && { notify "Nothing heard"; exit 0; }
+  local out=""
+  if ollama_up; then
+    out=$(gemma_chat "You are a translator. Translate the user's text into $TARGET_LANG. Output ONLY the translation, nothing else." "$raw")
+  fi
+  [ -z "$out" ] && out="$raw"
+  log "TRANSLATED: $out"
+  emit "$out"
+  notify "🌐 $TARGET_LANG" "$out"
+}
+
+do_command(){
+  notify "🛠️  Reading command…"
+  local instr; instr=$(transcribe "$LANG_CODE")
+  log "INSTR: $instr"
+  [ -z "$instr" ] && { notify "No command heard"; exit 0; }
+  is_junk "$instr" && { notify "No command heard"; exit 0; }
+  ollama_up || die "Ollama not running" "command mode needs Gemma"
+
+  # grab the currently selected text via clipboard (save + restore)
+  wl-paste -n > "$CLIPBAK" 2>/dev/null || : > "$CLIPBAK"
+  wtype -M ctrl c -m ctrl 2>>"$LOG"; sleep 0.25
+  local seltext; seltext=$(wl-paste -n 2>/dev/null)
+  if [ -z "$seltext" ]; then
+    notify "Select text first" "command mode edits selected text"; log "command: no selection"
+    [ -s "$CLIPBAK" ] && wl-copy < "$CLIPBAK"; return
+  fi
+  local out; out=$(gemma_chat "Apply the user's instruction to their text. Output ONLY the resulting text, nothing else — no preamble, no quotes." "Instruction: $instr
+
+Text:
+$seltext")
+  [ -z "$out" ] && { notify "Command failed"; [ -s "$CLIPBAK" ] && wl-copy < "$CLIPBAK"; return; }
+  log "CMD OUT: $out"
+  # paste over the selection
+  printf '%s' "$out" | wl-copy; sleep 0.1
+  wtype -M ctrl v -m ctrl 2>>"$LOG"
+  ( sleep 1.5; [ -s "$CLIPBAK" ] && wl-copy < "$CLIPBAK" || wl-copy --clear 2>/dev/null ) &
+  notify "🛠️ Done" "$out"
+}
+
+# ---------- output ----------
+emit(){
+  case "$PASTE_MODE" in
+    stdout)    printf '%s\n' "$1" ;;
+    clipboard) printf '%s' "$1" | wl-copy; log "clipboard" ;;
+    *)         paste_text "$1" ;;
+  esac
+}
+paste_text(){
+  local text="$1"
+  have wtype || { printf '%s\n' "$text"; return; }
+  local cls; cls=$(hyprctl activewindow -j 2>/dev/null | jq -r '.class // empty' | tr '[:upper:]' '[:lower:]')
+  log "target class: $cls"
+  case "$cls" in
+    *zen*|*firefox*|*chrom*|*brave*|*navigator*|*mullvad*|*librewolf*|*vivaldi*|*edge*)
+      if have wl-copy; then
+        wl-paste -n > "$CLIPBAK" 2>/dev/null || : > "$CLIPBAK"
+        printf '%s' "$text" | wl-copy; sleep 0.12
+        wtype -M ctrl v -m ctrl 2>>"$LOG"; log "paste Ctrl+V (browser)"
+        ( sleep 1.5; [ -s "$CLIPBAK" ] && wl-copy < "$CLIPBAK" || wl-copy --clear 2>/dev/null ) &
+      else wtype -d "$WTYPE_DELAY" "$text" 2>>"$LOG"; fi ;;
+    *)
+      wtype -d "$WTYPE_DELAY" "$text" 2>>"$LOG"; log "typed direct (d=$WTYPE_DELAY)" ;;
+  esac
+}
+
+cmd_toggle(){
+  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then exec "$0" stop; else exec "$0" start "${1:-dictate}"; fi
+}
+cmd_warm(){ curl -s --max-time 90 "$OLLAMA/api/generate" -d "$(jq -n --arg m "$GEMMA" --arg k "$KEEP_ALIVE" '{model:$m,prompt:"hi",stream:false,think:false,keep_alive:$k}')" >/dev/null 2>&1 && echo "warmed $GEMMA" || echo "warm failed"; }
+
+ok(){ printf '  \033[32m✓\033[0m %s\n' "$1"; }
+bad(){ printf '  \033[31m✗\033[0m %s\n' "$1"; FAILED=1; }
+cmd_doctor(){
+  FAILED=0; echo "signet doctor (v$VERSION)"; echo "deps:"
+  for c in pw-record ffmpeg jq curl wtype wl-copy wl-paste notify-send; do have "$c" && ok "$c" || bad "$c missing"; done
+  have pw-play && ok "pw-play (sound)" || echo "  - pw-play missing (no sound cue)"
+  echo "whisper:"; [ -x "$WHISPER" ] && ok "$WHISPER" || bad "whisper-cli not found"
+  [ -n "$MODEL" ] && [ -f "$MODEL" ] && ok "model: $MODEL" || bad "no model — run: signet setup"
+  echo "ollama:"
+  if ollama_up; then ok "running"; curl -s "$OLLAMA/api/tags" | jq -e --arg g "$GEMMA" '.models[]?.name|select(.==$g)' >/dev/null 2>&1 && ok "$GEMMA pulled" || bad "$GEMMA not pulled — ollama pull $GEMMA"
+  else bad "not running — ollama serve"; fi
+  echo "mic:"; have wpctl && { case "$(wpctl get-volume @DEFAULT_AUDIO_SOURCE@ 2>/dev/null)" in *MUTED*) bad "mic MUTED — signet setup";; *) ok "$(wpctl get-volume @DEFAULT_AUDIO_SOURCE@ 2>/dev/null)";; esac; }
+  echo "config: $CONFIG"
+  [ "$FAILED" = 0 ] && echo "All good." || return 1
+}
+gen_cues(){ have ffmpeg || return 0
+  [ -f "$DATA_DIR/start.wav" ] || ffmpeg -y -f lavfi -i "sine=frequency=880:duration=0.08" -af "afade=t=out:st=0.05:d=0.03" -ar 48000 "$DATA_DIR/start.wav" 2>/dev/null
+  [ -f "$DATA_DIR/stop.wav" ]  || ffmpeg -y -f lavfi -i "sine=frequency=520:duration=0.08" -af "afade=t=out:st=0.05:d=0.03" -ar 48000 "$DATA_DIR/stop.wav" 2>/dev/null; }
+cmd_setup(){
+  echo "signet setup"
+  [ -f "$CONFIG" ] || { write_default_config; echo "wrote $CONFIG"; }
+  [ -f "$DICT" ] || { printf '# one name/term per line; signet fixes phonetic mishears to these spellings\n' > "$DICT"; echo "wrote $DICT"; }
+  [ -f "$SNIPPETS" ] || { printf '# voice snippets:  cue = expansion\n# e.g.  my email = you@example.com\n' > "$SNIPPETS"; echo "wrote $SNIPPETS"; }
+  gen_cues && echo "sound cues ready"
+  have wpctl && { wpctl set-mute @DEFAULT_AUDIO_SOURCE@ 0 2>/dev/null; wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 0.6 2>/dev/null; echo "mic unmuted @ 0.6"; }
+  { [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; } && { echo "downloading base.en…"; fetch_model && echo "model ready" || echo "model dl failed"; } || echo "model: $MODEL"
+  ollama_up && { curl -s "$OLLAMA/api/tags" | jq -e --arg g "$GEMMA" '.models[]?.name|select(.==$g)' >/dev/null 2>&1 || { echo "pulling $GEMMA…"; ollama pull "$GEMMA"; }; } || echo "⚠️ ollama not running — then: ollama pull $GEMMA"
+  local bin; bin=$(command -v signet || echo "$0")
+  cat <<EOF
+
+Add to ~/.config/hypr/hyprland.conf:
+  bind  = , F9,  exec, $bin start
+  bindr = , F9,  exec, $bin stop
+  bind  = , F10, exec, $bin start command      # edit SELECTED text by voice
+  bindr = , F10, exec, $bin stop
+  bind  = , F11, exec, $bin start translate    # speak any language -> $TARGET_LANG
+  bindr = , F11, exec, $bin stop
+
+Hold F9 dictate · F10 command (on selected text) · F11 translate.
+EOF
+}
+fetch_model(){ curl -L --fail -o "$DATA_DIR/models/ggml-base.en.bin" "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin" && MODEL="$DATA_DIR/models/ggml-base.en.bin"; }
+write_default_config(){ cat > "$CONFIG" <<EOF
+# signet config
+GEMMA="gemma4:e2b"
+KEEP_ALIVE="30m"          # keep Gemma warm (memory vs cold-reload speed)
+LANG_CODE="en"
+PASTE_MODE="auto"         # auto | paste | clipboard | stdout
+CLEANUP=1                 # 1 = Gemma polish ; 0 = fast (whisper only, ~half time)
+TONE="auto"               # auto | none | email | slack | code | casual | formal
+TARGET_LANG="English"     # translate mode target
+SOUND=1
+WTYPE_DELAY=12            # ms between keys when typing directly
+MIC="@DEFAULT_AUDIO_SOURCE@"
+ON_OLLAMA_DOWN="warn-raw" # warn-raw | abort
+THREADS=8
+EOF
+}
+cmd_status(){
+  echo "signet v$VERSION"; echo "whisper: $WHISPER"; echo "model:   ${MODEL:-<none>}"
+  echo "gemma:   $GEMMA (keep_alive=$KEEP_ALIVE)  cleanup:$CLEANUP  tone:$TONE"
+  echo "paste:   $PASTE_MODE  sound:$SOUND  typedelay:$WTYPE_DELAY  lang:$LANG_CODE  target:$TARGET_LANG"
+  echo "recording:$([ -f "$PIDFILE" ] && echo ' active' || echo ' idle')"
+  echo "--- log ---"; tail -n 8 "$LOG" 2>/dev/null
+}
+usage(){ cat <<EOF
+signet v$VERSION — local voice dictation + AI commands (Hyprland)
+usage: signet <command>
+  start [dictate|command|translate]   begin recording (bind to key press)
+  stop                                stop + process (bind to key release)
+  toggle [mode]                       start/stop on one tap
+  warm | setup | doctor | status | config | version
+modes: dictate (clean+type) · command (edit selected text by voice) · translate (-> \$TARGET_LANG)
+EOF
+}
+case "${1:-}" in
+  start) cmd_start "${2:-dictate}" ;;
+  stop) cmd_stop ;;
+  toggle) cmd_toggle "${2:-dictate}" ;;
+  warm) cmd_warm ;;
+  setup) cmd_setup ;;
+  doctor) cmd_doctor ;;
+  status) cmd_status ;;
+  config) echo "$CONFIG" ;;
+  version|--version|-v) echo "signet $VERSION" ;;
+  ""|help|-h|--help) usage ;;
+  *) echo "unknown: $1" >&2; usage; exit 1 ;;
+esac
