@@ -87,12 +87,12 @@ cmd_stop(){
   [ -x "$WHISPER" ] || die "whisper not found ($WHISPER)" "run: scriptorium doctor"
   [ -n "$MODEL" ] && [ -f "$MODEL" ] || die "no whisper model" "run: scriptorium setup"
 
-  # denoise + bandpass + normalize for noisy mics
+  # denoise + bandpass + trim leading/trailing silence + normalize.
+  # silence trimming (areverse trick) stops whisper hallucinating on pauses.
+  local src="$WAV"
   if have ffmpeg; then
-    ffmpeg -y -i "$WAV" -af "highpass=f=100,lowpass=f=8000,afftdn=nf=-25,dynaudnorm=f=200" \
-      -ar 16000 -ac 1 "$CLEANWAV" 2>/dev/null && local src="$CLEANWAV" || local src="$WAV"
-  else
-    local src="$WAV"
+    ffmpeg -y -i "$WAV" -af "highpass=f=100,lowpass=f=8000,afftdn=nf=-25,silenceremove=start_periods=1:start_duration=0.1:start_threshold=-45dB:detection=peak,areverse,silenceremove=start_periods=1:start_duration=0.1:start_threshold=-45dB:detection=peak,areverse,dynaudnorm=f=200" \
+      -ar 16000 -ac 1 "$CLEANWAV" 2>/dev/null && [ -s "$CLEANWAV" ] && src="$CLEANWAV"
   fi
 
   local names=""
@@ -100,11 +100,13 @@ cmd_stop(){
 
   notify "✍️  Transcribing…"
   local raw
-  raw=$("$WHISPER" -m "$MODEL" -l "$LANG_CODE" -nt ${names:+--prompt "$names"} \
+  raw=$("$WHISPER" -m "$MODEL" -l "$LANG_CODE" -nt -sns ${names:+--prompt "$names"} \
         -f "$src" -t "$THREADS" 2>/dev/null | tr '\n' ' ' | sed 's/^ *//; s/ *$//')
   log "RAW: $raw"
   [ -z "$raw" ] && { notify "Nothing heard"; exit 0; }
-  # drop whisper silence/noise hallucinations
+  # strip trailing whisper hallucinations: 2+ repeated "you", or trailing filler bursts
+  raw=$(printf '%s' "$raw" | sed -E 's/([[:space:]]+(you|thank you|bye|so|uh|um)){2,}[[:punct:]]*[[:space:]]*$//I' | sed -E 's/[[:space:]]+$//')
+  # drop whisper silence/noise hallucinations (whole-output junk)
   local junk; junk=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -d '[:punct:][:space:]')
   case "$junk" in
     ""|you|youyou|thankyou|thanks|thanksforwatching|okay|ok|bye|so|uh|um|blankaudio|musicplaying) \
@@ -142,23 +144,27 @@ emit(){ # output the text per PASTE_MODE
 
 paste_text(){
   local text="$1"
-  have wl-copy || { printf '%s\n' "$text"; return; }
-  # save current clipboard, then restore after paste so we don't clobber it
-  wl-paste -n > "$CLIPBAK" 2>/dev/null || : > "$CLIPBAK"
-  printf '%s' "$text" | wl-copy
+  have wtype || { printf '%s\n' "$text"; return; }
   local cls; cls=$(hyprctl activewindow -j 2>/dev/null | jq -r '.class // empty' | tr '[:upper:]' '[:lower:]')
   log "target class: $cls"
-  sleep 0.12
   case "$cls" in
     *zen*|*firefox*|*chrom*|*brave*|*navigator*|*mullvad*|*librewolf*|*vivaldi*|*edge*)
-      wtype -M ctrl v -m ctrl 2>>"$LOG"; log "paste Ctrl+V (browser)" ;;
-    *kitty*|*foot*|*ghostty*|*alacritty*|*wezterm*|*konsole*|*term*)
-      wtype -M ctrl -M shift v -m shift -m ctrl 2>>"$LOG"; log "paste Ctrl+Shift+V (terminal)" ;;
+      # browsers ignore synthetic typing in contenteditable -> clipboard + Ctrl+V.
+      # save/restore clipboard, with a long delay so the paste finishes before restore (no race).
+      if have wl-copy; then
+        wl-paste -n > "$CLIPBAK" 2>/dev/null || : > "$CLIPBAK"
+        printf '%s' "$text" | wl-copy
+        sleep 0.12
+        wtype -M ctrl v -m ctrl 2>>"$LOG"
+        log "paste Ctrl+V (browser)"
+        ( sleep 1.5; if [ -s "$CLIPBAK" ]; then wl-copy < "$CLIPBAK"; else wl-copy --clear 2>/dev/null; fi ) &
+      else
+        wtype -d 2 "$text" 2>>"$LOG"
+      fi ;;
     *)
-      wtype -d 1 "$text" 2>>"$LOG" || wtype -M ctrl v -m ctrl 2>>"$LOG"; log "typed/paste (native)" ;;
+      # terminals (incl. opencode TUI) + native apps: type directly. No clipboard, no race.
+      wtype -d 2 "$text" 2>>"$LOG"; log "typed direct" ;;
   esac
-  # restore the user's clipboard
-  ( sleep 0.4; if [ -s "$CLIPBAK" ]; then wl-copy < "$CLIPBAK"; else wl-copy --clear 2>/dev/null; fi ) &
 }
 
 cmd_toggle(){
