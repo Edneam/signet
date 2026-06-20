@@ -80,15 +80,20 @@ case "${1:-}" in
     [ -z "$CLEAN" ] && CLEAN="$RAW"
     log "CLEAN: $CLEAN"
 
-    # type at cursor; if wtype fails, fall back to clipboard
-    if wtype -d 1 "$CLEAN" 2>>"$LOG"; then
-      log "wtype OK"
-    else
-      log "wtype FAILED -> clipboard"
-      printf '%s' "$CLEAN" | wl-copy
-      notify "Copied to clipboard (paste manually)" "$CLEAN"
-      exit 0
-    fi
+    # inject — context-aware. Browsers (WhatsApp Web) ignore synthetic typing,
+    # so clipboard + Ctrl+V is reliable there. Always copy first as a fallback.
+    printf '%s' "$CLEAN" | wl-copy
+    CLS=$(hyprctl activewindow -j 2>/dev/null | jq -r '.class // empty' | tr '[:upper:]' '[:lower:]')
+    log "target class: $CLS"
+    sleep 0.1
+    case "$CLS" in
+      *zen*|*firefox*|*chrom*|*brave*|*navigator*|*mullvad*|*librewolf*|*vivaldi*|*edge*)
+        wtype -M ctrl v -m ctrl 2>>"$LOG"; log "pasted Ctrl+V (browser)" ;;
+      *kitty*|*foot*|*ghostty*|*alacritty*|*wezterm*|*konsole*|*term*)
+        wtype -M ctrl -M shift v -m shift -m ctrl 2>>"$LOG"; log "pasted Ctrl+Shift+V (terminal)" ;;
+      *)
+        if wtype -d 1 "$CLEAN" 2>>"$LOG"; then log "wtype OK"; else wtype -M ctrl v -m ctrl 2>>"$LOG"; log "fallback Ctrl+V"; fi ;;
+    esac
     notify "✅ Done" "$CLEAN"
     ;;
 
