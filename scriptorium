@@ -25,13 +25,14 @@ MODEL=""                       # auto-detected if empty
 WHISPER=""                     # auto-detected if empty
 GEMMA="gemma4:e2b"
 OLLAMA="http://localhost:11434"
-KEEP_ALIVE="5m"
+KEEP_ALIVE="30m"
 LANG_CODE="en"
 PASTE_MODE="auto"              # auto | paste | clipboard | stdout
 SOUND=1                        # 1 = subtle start/stop cue
 MIC="@DEFAULT_AUDIO_SOURCE@"
 ON_OLLAMA_DOWN="warn-raw"      # warn-raw | abort
-THREADS=12
+CLEANUP=1                      # 1 = Gemma polish (slower, nicer) ; 0 = fast mode (whisper only, ~half the time)
+THREADS=8
 [ -f "$CONFIG" ] && . "$CONFIG"
 
 # auto-detect whisper binary: PATH (AUR) first, then a local source build
@@ -39,11 +40,12 @@ if [ -z "$WHISPER" ]; then
   WHISPER=$(command -v whisper-cli 2>/dev/null) || true
   [ -z "$WHISPER" ] && WHISPER="$HOME/projects/whisper.cpp/build/bin/whisper-cli"
 fi
-# auto-detect model: XDG share first, then a local source build
+# auto-detect model: prefer base.en (fast) then small.en (more accurate, slower)
 if [ -z "$MODEL" ]; then
-  for m in "$DATA_DIR/models/ggml-small.en.bin" \
-           "$HOME/projects/whisper.cpp/models/ggml-small.en.bin" \
-           "$DATA_DIR/models/ggml-base.en.bin"; do
+  for m in "$DATA_DIR/models/ggml-base.en.bin" \
+           "$HOME/projects/whisper.cpp/models/ggml-base.en.bin" \
+           "$DATA_DIR/models/ggml-small.en.bin" \
+           "$HOME/projects/whisper.cpp/models/ggml-small.en.bin"; do
     [ -f "$m" ] && { MODEL="$m"; break; }
   done
 fi
@@ -69,6 +71,8 @@ cmd_start(){
   log "START recording (mic=$MIC)"
   notify "🎤 Recording…"
   blip start
+  # warm the cleanup model WHILE you talk — hides Gemma's cold-load behind the recording
+  ( curl -s --max-time 30 "$OLLAMA/api/generate" -d "$(jq -n --arg m "$GEMMA" --arg k "$KEEP_ALIVE" '{model:$m,prompt:"ok",stream:false,think:false,keep_alive:$k}')" >/dev/null 2>&1 & )
   pw-record --target "$MIC" --rate 16000 --channels 1 "$WAV" &
   echo $! > "$PIDFILE"
 }
@@ -87,11 +91,11 @@ cmd_stop(){
   [ -x "$WHISPER" ] || die "whisper not found ($WHISPER)" "run: scriptorium doctor"
   [ -n "$MODEL" ] && [ -f "$MODEL" ] || die "no whisper model" "run: scriptorium setup"
 
-  # denoise + bandpass + trim leading/trailing silence + normalize.
+  # light filter: bandpass + trim leading/trailing silence + normalize (fast).
   # silence trimming (areverse trick) stops whisper hallucinating on pauses.
   local src="$WAV"
   if have ffmpeg; then
-    ffmpeg -y -i "$WAV" -af "highpass=f=100,lowpass=f=8000,afftdn=nf=-25,silenceremove=start_periods=1:start_duration=0.1:start_threshold=-45dB:detection=peak,areverse,silenceremove=start_periods=1:start_duration=0.1:start_threshold=-45dB:detection=peak,areverse,dynaudnorm=f=200" \
+    ffmpeg -y -i "$WAV" -af "highpass=f=100,lowpass=f=8000,silenceremove=start_periods=1:start_duration=0.1:start_threshold=-45dB:detection=peak,areverse,silenceremove=start_periods=1:start_duration=0.1:start_threshold=-45dB:detection=peak,areverse,dynaudnorm=f=200" \
       -ar 16000 -ac 1 "$CLEANWAV" 2>/dev/null && [ -s "$CLEANWAV" ] && src="$CLEANWAV"
   fi
 
@@ -100,7 +104,7 @@ cmd_stop(){
 
   notify "✍️  Transcribing…"
   local raw
-  raw=$("$WHISPER" -m "$MODEL" -l "$LANG_CODE" -nt -sns ${names:+--prompt "$names"} \
+  raw=$("$WHISPER" -m "$MODEL" -l "$LANG_CODE" -nt -sns -bo 1 -bs 1 ${names:+--prompt "$names"} \
         -f "$src" -t "$THREADS" 2>/dev/null | tr '\n' ' ' | sed 's/^ *//; s/ *$//')
   log "RAW: $raw"
   [ -z "$raw" ] && { notify "Nothing heard"; exit 0; }
@@ -113,9 +117,11 @@ cmd_stop(){
       notify "Nothing heard"; log "skip: junk '$raw'"; exit 0 ;;
   esac
 
-  # ---- Gemma cleanup (graceful if ollama down) ----
+  # ---- Gemma cleanup (graceful if ollama down; skipped in fast mode) ----
   local clean=""
-  if curl -s --max-time 2 "$OLLAMA/api/tags" >/dev/null 2>&1; then
+  if [ "$CLEANUP" != 1 ]; then
+    clean="$raw"; log "fast mode: skipped cleanup"
+  elif curl -s --max-time 2 "$OLLAMA/api/tags" >/dev/null 2>&1; then
     local sys="You clean up dictated speech. Remove fillers (um, uh, like, you know) and false starts/repeated words. Keep the exact meaning, capitalization and punctuation. Never add, reword, translate, or explain. Output ONLY the cleaned text and nothing else."
     [ -n "$names" ] && sys="$sys Known names/terms — if a word closely matches one phonetically, correct it to this exact spelling: $names."
     clean=$(curl -s --max-time 60 "$OLLAMA/api/chat" -d "$(jq -n --arg t "$raw" --arg m "$GEMMA" --arg k "$KEEP_ALIVE" --arg sys "$sys" \
@@ -242,27 +248,29 @@ cmd_setup(){
 }
 
 fetch_model(){
-  local url="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin"
-  local out="$DATA_DIR/models/ggml-small.en.bin"
+  local url="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+  local out="$DATA_DIR/models/ggml-base.en.bin"
   curl -L --fail -o "$out" "$url" && MODEL="$out"
 }
 
 write_default_config(){
   cat > "$CONFIG" <<EOF
 # scriptorium config — uncomment/edit to override defaults
-# MODEL="$DATA_DIR/models/ggml-small.en.bin"
+# MODEL="$DATA_DIR/models/ggml-base.en.bin"   # base.en=fast (default), small.en=more accurate/slower
 # WHISPER="/usr/bin/whisper-cli"
 GEMMA="gemma4:e2b"
-KEEP_ALIVE="5m"
+KEEP_ALIVE="30m"          # keep Gemma warm between dictations (avoids slow cold reload)
 LANG_CODE="en"
 # PASTE_MODE: auto | paste | clipboard | stdout
 PASTE_MODE="auto"
+# CLEANUP: 1 = Gemma polish (nicer) ; 0 = fast mode (whisper only, ~half the time)
+CLEANUP=1
 SOUND=1
 # MIC: @DEFAULT_AUDIO_SOURCE@ or a pw node id
 MIC="@DEFAULT_AUDIO_SOURCE@"
 # ON_OLLAMA_DOWN: warn-raw | abort
 ON_OLLAMA_DOWN="warn-raw"
-THREADS=12
+THREADS=8
 EOF
 }
 
