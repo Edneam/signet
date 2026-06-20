@@ -215,7 +215,7 @@ do_dictate(){
           {role:"user",content:"so i was thinking we could maybe meet tomorrow and discuss the project"},
           {role:"assistant",content:"I was thinking we could meet tomorrow and discuss the project."},
           {role:"user",content:"the meeting is at three pm on june twenty and it costs twenty dollars"},
-          {role:"assistant",content:"The meeting is at 3 PM on June 20, and it costs \$20."},
+          {role:"assistant",content:"The meeting is at 3 PM on June 20, and it costs $20."},
           {role:"user",content:$u}]}')" \
       | jq -r '.message.content // empty' | sed 's/^ *//; s/ *$//')
   else
