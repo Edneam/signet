@@ -1,7 +1,3 @@
-# transient runtime files
 *.wav
 *.log
-ptt.rec.pid
-
-# local backups
 *.bak
