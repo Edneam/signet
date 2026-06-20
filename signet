@@ -38,7 +38,13 @@ THREADS=8
 WTYPE_DELAY=12                 # ms between keystrokes when typing directly (fixes dropped/doubled chars)
 TONE="auto"                    # auto | none | email | slack | code | casual | formal
 TARGET_LANG="English"          # translation mode target
+STT_ENGINE="parakeet"          # parakeet (fast, warm server) | whisper (whisper.cpp)
+ASR_PYTHON="$DATA_DIR/asr/bin/python"      # venv python for the Parakeet server
+ASR_MODEL_DIR="$DATA_DIR/models/parakeet-v3"
+ASR_PORT=8126
 [ -f "$CONFIG" ] && . "$CONFIG"
+# resolve the Parakeet server script next to this binary (repo or /usr/bin)
+ASR_SERVER="$(dirname "$(readlink -f "$0")")/signet-asr"
 
 # auto-detect whisper binary
 if [ -z "$WHISPER" ]; then
@@ -60,7 +66,16 @@ have(){ command -v "$1" >/dev/null 2>&1; }
 blip(){ [ "$SOUND" = 1 ] || return 0; local f="$DATA_DIR/$1.wav"; [ -f "$f" ] && have pw-play && (pw-play --volume 0.4 "$f" >/dev/null 2>&1 &) || true; }
 die(){ notify "⚠️ $1" "${2:-}"; log "ERROR: $1 ${2:-}"; echo "signet: $1" >&2; exit 1; }
 ollama_up(){ curl -s --max-time 2 "$OLLAMA/api/tags" >/dev/null 2>&1; }
-warm_bg(){ ( curl -s --max-time 30 "$OLLAMA/api/generate" -d "$(jq -n --arg m "$GEMMA" --arg k "$KEEP_ALIVE" '{model:$m,prompt:"",stream:false,think:false,keep_alive:$k}')" >/dev/null 2>&1 & ); }
+asr_up(){ curl -s --max-time 1 "http://127.0.0.1:$ASR_PORT/" >/dev/null 2>&1; }
+asr_ensure(){ # start the warm Parakeet server if not already running
+  asr_up && return 0
+  [ -x "$ASR_PYTHON" ] && [ -f "$ASR_SERVER" ] && [ -d "$ASR_MODEL_DIR" ] || return 1
+  log "starting parakeet server"
+  nohup "$ASR_PYTHON" "$ASR_SERVER" "$ASR_MODEL_DIR" "$ASR_PORT" >>"$STATE_DIR/asr.log" 2>&1 &
+  for _ in $(seq 1 60); do asr_up && { log "parakeet up"; return 0; }; sleep 0.5; done
+  log "parakeet failed to start"; return 1
+}
+warm_bg(){ ( curl -s --max-time 30 "$OLLAMA/api/generate" -d "$(jq -n --arg m "$GEMMA" --arg k "$KEEP_ALIVE" '{model:$m,prompt:"",stream:false,think:false,keep_alive:$k}')" >/dev/null 2>&1 & ); [ "$STT_ENGINE" = parakeet ] && ( asr_ensure & ); }
 [ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null||echo 0)" -gt 1048576 ] && mv "$LOG" "$LOG.1"
 
 # call Gemma chat: $1=system $2=user -> stdout (empty on failure)
@@ -113,6 +128,12 @@ transcribe(){ # $1 = lang ; echoes cleaned RAW transcript
   if have ffmpeg; then
     ffmpeg -y -i "$WAV" -af "highpass=f=100,lowpass=f=8000,silenceremove=start_periods=1:start_duration=0.1:start_threshold=-45dB:detection=peak,areverse,silenceremove=start_periods=1:start_duration=0.1:start_threshold=-45dB:detection=peak,areverse,dynaudnorm=f=200" -ar 16000 -ac 1 "$CLEANWAV" 2>/dev/null && [ -s "$CLEANWAV" ] && src="$CLEANWAV"
   fi
+  # Parakeet (warm server) — fast, auto-language, no prompt biasing
+  if [ "$STT_ENGINE" = parakeet ] && asr_ensure; then
+    curl -s --max-time 60 --data-binary "$src" "http://127.0.0.1:$ASR_PORT/" | tr '\n' ' ' | sed 's/^ *//; s/ *$//'
+    return
+  fi
+  # whisper.cpp fallback
   [ -f "$DICT" ] && names=$(grep -vE '^\s*$|^#' "$DICT" | paste -sd ', ')
   "$WHISPER" -m "$MODEL" -l "$lang" -nt -sns -bo 1 -bs 1 ${names:+--prompt "$names"} -f "$src" -t "$THREADS" 2>/dev/null \
     | tr '\n' ' ' | sed 's/^ *//; s/ *$//'
@@ -142,8 +163,12 @@ cmd_stop(){
   blip stop
   [ -s "$WAV" ] || { notify "No audio"; exit 0; }
   [ "$(stat -c%s "$WAV")" -lt 12000 ] && { notify "Too short"; log "skip: short"; exit 0; }
-  [ -x "$WHISPER" ] || die "whisper not found" "run: signet doctor"
-  [ -n "$MODEL" ] && [ -f "$MODEL" ] || die "no model" "run: signet setup"
+  if [ "$STT_ENGINE" = parakeet ]; then
+    [ -d "$ASR_MODEL_DIR" ] && [ -x "$ASR_PYTHON" ] || die "Parakeet not installed" "run: signet setup, or set STT_ENGINE=whisper"
+  else
+    [ -x "$WHISPER" ] || die "whisper not found" "run: signet doctor"
+    [ -n "$MODEL" ] && [ -f "$MODEL" ] || die "no model" "run: signet setup"
+  fi
 
   case "$mode" in
     command)   do_command ;;
@@ -168,9 +193,15 @@ do_dictate(){
   if [ "$CLEANUP" != 1 ]; then clean="$raw"; log "fast mode"
   elif ollama_up; then
     local names sys; [ -f "$DICT" ] && names=$(grep -vE '^\s*$|^#' "$DICT" | paste -sd ', ')
-    sys="You clean up dictated speech. Remove fillers (um, uh, like, you know) and false starts/repeated words. Keep the exact meaning, capitalization and punctuation. Never add, reword, translate, or explain. Output ONLY the cleaned text and nothing else.$(tone_hint)"
-    [ -n "${names:-}" ] && sys="$sys Known names/terms — if a word closely matches one phonetically, correct it to this exact spelling: $names."
-    clean=$(gemma_chat "$sys" "$raw")
+    sys="Clean up dictated speech: remove fillers (um, uh, like, you know) and repeated/false-start words, and add correct punctuation and capitalization. Keep ALL of the user's real words — do not summarize, drop phrases, reword, translate, or explain. Output ONLY the cleaned text.$(tone_hint)"
+    [ -n "${names:-}" ] && sys="$sys If a word closely matches one of these names/terms phonetically, fix it to this exact spelling: $names."
+    clean=$(curl -s --max-time 60 "$OLLAMA/api/chat" -d "$(jq -n --arg m "$GEMMA" --arg k "$KEEP_ALIVE" --arg s "$sys" --arg u "$raw" \
+      '{model:$m,think:false,stream:false,keep_alive:$k,options:{temperature:0,num_predict:400,stop:["\nInput:","Input:"]},
+        messages:[{role:"system",content:$s},
+          {role:"user",content:"and so um my fellow americans ask not what your country can do for you you know ask what you can do for your country"},
+          {role:"assistant",content:"And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country."},
+          {role:"user",content:$u}]}')" \
+      | jq -r '.message.content // empty' | sed 's/^ *//; s/ *$//')
   else
     [ "$ON_OLLAMA_DOWN" = abort ] && die "Ollama not running" "start it: ollama serve"
     notify "⚠️ Ollama down — raw text"; log "ollama down"
@@ -255,7 +286,10 @@ paste_text(){
 cmd_toggle(){
   if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then exec "$0" stop; else exec "$0" start "${1:-dictate}"; fi
 }
-cmd_warm(){ curl -s --max-time 90 "$OLLAMA/api/generate" -d "$(jq -n --arg m "$GEMMA" --arg k "$KEEP_ALIVE" '{model:$m,prompt:"hi",stream:false,think:false,keep_alive:$k}')" >/dev/null 2>&1 && echo "warmed $GEMMA" || echo "warm failed"; }
+cmd_warm(){
+  [ "$STT_ENGINE" = parakeet ] && { asr_ensure && echo "parakeet warm" || echo "parakeet warm failed"; }
+  curl -s --max-time 90 "$OLLAMA/api/generate" -d "$(jq -n --arg m "$GEMMA" --arg k "$KEEP_ALIVE" '{model:$m,prompt:"hi",stream:false,think:false,keep_alive:$k}')" >/dev/null 2>&1 && echo "warmed $GEMMA" || echo "gemma warm failed"
+}
 
 ok(){ printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad(){ printf '  \033[31m✗\033[0m %s\n' "$1"; FAILED=1; }
@@ -263,8 +297,15 @@ cmd_doctor(){
   FAILED=0; echo "signet doctor (v$VERSION)"; echo "deps:"
   for c in pw-record ffmpeg jq curl wtype wl-copy wl-paste notify-send; do have "$c" && ok "$c" || bad "$c missing"; done
   have pw-play && ok "pw-play (sound)" || echo "  - pw-play missing (no sound cue)"
-  echo "whisper:"; [ -x "$WHISPER" ] && ok "$WHISPER" || bad "whisper-cli not found"
-  [ -n "$MODEL" ] && [ -f "$MODEL" ] && ok "model: $MODEL" || bad "no model — run: signet setup"
+  echo "STT engine: $STT_ENGINE"
+  if [ "$STT_ENGINE" = parakeet ]; then
+    [ -x "$ASR_PYTHON" ] && ok "asr venv: $ASR_PYTHON" || bad "asr venv missing — run: signet setup"
+    [ -d "$ASR_MODEL_DIR" ] && ok "parakeet model: $ASR_MODEL_DIR" || bad "parakeet model missing"
+    [ -f "$ASR_SERVER" ] && ok "asr server script" || bad "signet-asr script missing"
+    asr_up && ok "parakeet server running" || echo "  - parakeet server not running (starts on first use)"
+  fi
+  echo "whisper (fallback):"; [ -x "$WHISPER" ] && ok "$WHISPER" || echo "  - whisper-cli not found"
+  [ -n "$MODEL" ] && [ -f "$MODEL" ] && ok "model: $MODEL" || echo "  - no whisper model"
   echo "ollama:"
   if ollama_up; then ok "running"; curl -s "$OLLAMA/api/tags" | jq -e --arg g "$GEMMA" '.models[]?.name|select(.==$g)' >/dev/null 2>&1 && ok "$GEMMA pulled" || bad "$GEMMA not pulled — ollama pull $GEMMA"
   else bad "not running — ollama serve"; fi
@@ -288,6 +329,7 @@ cmd_setup(){
   cat <<EOF
 
 Add to ~/.config/hypr/hyprland.conf:
+  exec-once = $bin warm                        # preload Parakeet + Gemma at login (no cold start)
   bind  = , F9,  exec, $bin start
   bindr = , F9,  exec, $bin stop
   bind  = , F10, exec, $bin start command      # edit SELECTED text by voice
@@ -296,16 +338,20 @@ Add to ~/.config/hypr/hyprland.conf:
   bindr = , F11, exec, $bin stop
 
 Hold F9 dictate · F10 command (on selected text) · F11 translate.
+Parakeet STT: if not installed, see README (uv venv + onnx-asr + model download).
 EOF
 }
 fetch_model(){ curl -L --fail -o "$DATA_DIR/models/ggml-base.en.bin" "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin" && MODEL="$DATA_DIR/models/ggml-base.en.bin"; }
 write_default_config(){ cat > "$CONFIG" <<EOF
 # signet config
+STT_ENGINE="parakeet"     # parakeet (fast, warm server, auto-language) | whisper (whisper.cpp)
+ASR_MODEL_DIR="$DATA_DIR/models/parakeet-v3"
+ASR_PORT=8126
 GEMMA="gemma4:e2b"
-KEEP_ALIVE="30m"          # keep Gemma warm (memory vs cold-reload speed)
+KEEP_ALIVE="30m"          # keep Gemma warm (memory vs cold-reload speed); "-1" = never unload
 LANG_CODE="en"
 PASTE_MODE="auto"         # auto | paste | clipboard | stdout
-CLEANUP=1                 # 1 = Gemma polish ; 0 = fast (whisper only, ~half time)
+CLEANUP=1                 # 1 = Gemma polish ; 0 = fast (whisper/parakeet only, ~half time)
 TONE="auto"               # auto | none | email | slack | code | casual | formal
 TARGET_LANG="English"     # translate mode target
 SOUND=1

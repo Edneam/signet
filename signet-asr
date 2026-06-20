@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+# signet-asr — tiny persistent Parakeet ASR server (loads model once, stays warm).
+# usage: signet-asr <model_dir> [port]
+# POST a wav file path as the body to /  ->  returns transcript text.
+import sys, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import onnx_asr
+
+MODEL_DIR = sys.argv[1] if len(sys.argv) > 1 else None
+PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8126
+
+print(f"signet-asr: loading parakeet int8 from {MODEL_DIR} ...", flush=True)
+_t = time.time()
+MODEL = onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v3", MODEL_DIR, quantization="int8")
+print(f"signet-asr: ready in {time.time()-_t:.1f}s on :{PORT}", flush=True)
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        path = self.rfile.read(n).decode("utf-8", "ignore").strip()
+        try:
+            txt = MODEL.recognize(path) or ""
+            body = txt.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers(); self.wfile.write(body)
+        except Exception as e:
+            msg = str(e).encode("utf-8")
+            self.send_response(500); self.send_header("Content-Length", str(len(msg)))
+            self.end_headers(); self.wfile.write(msg)
+    def log_message(self, *a): pass
+
+ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()

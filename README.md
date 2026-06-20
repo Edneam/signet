@@ -21,7 +21,7 @@ Plus **snippets**: say a cue ("my email") → it expands to canned text, instant
 ## Why it's different
 Open-source dictation tools stop at raw transcription. Signet adds the **cleanup + AI command layer** that makes tools like Wispr Flow feel magic — and it's **free, unlimited, and 100% local**. Wispr gates unlimited words and AI commands behind a subscription; Signet gives them away because there's no metering.
 
-- **STT:** whisper.cpp `base.en` (fast; `small.en` optional)
+- **STT:** NVIDIA **Parakeet V3** (int8, ONNX, CPU-optimized) via a tiny warm server — ~3x real-time, excellent accuracy, automatic language detection. whisper.cpp `base.en` is a built-in fallback (`STT_ENGINE=whisper`).
 - **Brain:** Gemma 4 `e2b` via Ollama — cleanup, commands, translation; warm-on-keypress
 - **Injection:** Ctrl+V for browsers (WhatsApp Web), direct typing for terminals/native; **saves & restores your clipboard**
 - **~3s fast mode / ~6s with full polish**, fully on-device. Subtle sound cues. Graceful when Ollama is down.
@@ -39,12 +39,27 @@ Deps: `whisper.cpp ollama wtype wl-clipboard pipewire ffmpeg jq curl libnotify`.
 ## Setup
 
 ```bash
-signet setup     # downloads model, pulls gemma4:e2b, unmutes mic, generates cues, prints binds
+signet setup     # downloads whisper fallback model, pulls gemma4:e2b, unmutes mic, generates cues, prints binds
 signet doctor    # verifies everything
 ```
 
+### Parakeet STT (default engine — fast, recommended)
+Parakeet runs in a lightweight ONNX venv (no PyTorch). One-time install:
+```bash
+uv venv ~/.local/share/signet/asr
+uv pip install --python ~/.local/share/signet/asr "onnx-asr[cpu,hub]"
+~/.local/share/signet/asr/bin/python - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download("istupakov/parakeet-tdt-0.6b-v3-onnx",
+    local_dir="$HOME/.local/share/signet/models/parakeet-v3",
+    allow_patterns=["*int8*","*.json","*.txt","vocab*","config*"])
+PY
+```
+(Prefer whisper instead? Set `STT_ENGINE=whisper` in config — no Parakeet install needed.)
+
 Add to `~/.config/hypr/hyprland.conf`:
 ```ini
+exec-once = signet warm                  # preload Parakeet + Gemma at login (no cold start)
 bind  = , F9,  exec, signet start
 bindr = , F9,  exec, signet stop
 bind  = , F10, exec, signet start command
@@ -56,9 +71,10 @@ Push-to-talk keys must be **non-modifiers** (F-keys). For single-tap, bind `sign
 
 ## Config — `~/.config/signet/config`
 ```sh
+STT_ENGINE="parakeet"     # parakeet (fast, auto-language) | whisper
 GEMMA="gemma4:e2b"
-KEEP_ALIVE="30m"          # keep Gemma warm (memory vs cold-reload speed)
-CLEANUP=1                 # 1 = Gemma polish ; 0 = fast mode (whisper only, ~half time)
+KEEP_ALIVE="30m"          # keep Gemma warm; "-1" = never unload (no cold starts, more RAM)
+CLEANUP=1                 # 1 = Gemma polish ; 0 = fast mode (STT only, ~half time)
 TONE="auto"               # auto | none | email | slack | code | casual | formal
 TARGET_LANG="English"     # translate mode target
 PASTE_MODE="auto"         # auto | paste | clipboard | stdout
