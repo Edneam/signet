@@ -46,6 +46,10 @@ STT_ENGINE="parakeet"          # parakeet (fast, warm server) | whisper (whisper
 ASR_PYTHON="$DATA_DIR/asr/bin/python"      # venv python for the Parakeet server
 ASR_MODEL_DIR="$DATA_DIR/models/parakeet-v3"
 ASR_PORT=8126
+GEMMA_BACKEND="local"          # local (ollama, offline) | aistudio (Gemma 4 via free Gemini API key)
+AISTUDIO_KEY=""                # free key from aistudio.google.com/apikey (put in config, NOT in repo)
+AISTUDIO_MODEL="gemma-4-26b-a4b-it"  # gemma-4-26b-a4b-it (fast MoE) or gemma-4-31b-it
+AISTUDIO_URL="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 [ -f "$CONFIG" ] && . "$CONFIG"
 # back-compat: honor old TONE setting if MODE wasn't customized
 [ "${MODE:-auto}" = auto ] && [ "${TONE:-auto}" != auto ] && MODE="$TONE"
@@ -85,11 +89,23 @@ warm_bg(){ ( curl -s --max-time 30 "$OLLAMA/api/generate" -d "$(jq -n --arg m "$
 [ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null||echo 0)" -gt 1048576 ] && mv "$LOG" "$LOG.1"
 
 # call Gemma chat: $1=system $2=user -> stdout (empty on failure)
-gemma_chat(){
-  curl -s --max-time 60 "$OLLAMA/api/chat" -d "$(jq -n --arg m "$GEMMA" --arg k "$KEEP_ALIVE" --arg s "$1" --arg u "$2" \
-    '{model:$m,think:false,stream:false,keep_alive:$k,options:{temperature:0,num_predict:400,stop:["\nInput:","Input:"]},
-      messages:[{role:"system",content:$s},{role:"user",content:$u}]}')" \
-    | jq -r '.message.content // empty' | sed 's/^ *//; s/ *$//'
+llm_ready(){ if [ "$GEMMA_BACKEND" = aistudio ]; then [ -n "$AISTUDIO_KEY" ]; else ollama_up; fi; }
+llm_chat_messages(){ # $1 = JSON array of chat messages -> cleaned content on stdout
+  local msgs="$1"
+  if [ "$GEMMA_BACKEND" = aistudio ] && [ -n "$AISTUDIO_KEY" ]; then
+    curl -s --max-time 60 "$AISTUDIO_URL" -H "Authorization: Bearer $AISTUDIO_KEY" -H "Content-Type: application/json" \
+      -d "$(jq -n --arg m "$AISTUDIO_MODEL" --argjson msgs "$msgs" '{model:$m,temperature:0,messages:$msgs}')" \
+      | jq -r '.choices[0].message.content // empty' \
+      | perl -0777 -pe 's{<thought>.*?</thought>}{}gs; s{<think>.*?</think>}{}gs' \
+      | sed 's/^ *//; s/ *$//'
+  else
+    curl -s --max-time 60 "$OLLAMA/api/chat" -d "$(jq -n --arg m "$GEMMA" --arg k "$KEEP_ALIVE" --argjson msgs "$msgs" \
+      '{model:$m,think:false,stream:false,keep_alive:$k,options:{temperature:0,num_predict:400,stop:["\nInput:","Input:"]},messages:$msgs}')" \
+      | jq -r '.message.content // empty' | sed 's/^ *//; s/ *$//'
+  fi
+}
+gemma_chat(){ # $1 system $2 user -> content (routes local/cloud)
+  llm_chat_messages "$(jq -n --arg s "$1" --arg u "$2" '[{role:"system",content:$s},{role:"user",content:$u}]')"
 }
 
 mode_hint(){ # per-context guidance appended to the cleanup prompt; auto from active window
@@ -122,6 +138,7 @@ cmd_start(){
   log "START (${1:-dictate})"
   case "${1:-dictate}" in
     command)   notify "🛠️  Command…" ;;
+    agent)     notify "🤖 Agent…" ;;
     translate) notify "🌐 Translate…" ;;
     *)         notify "🎤 Recording…" ;;
   esac
@@ -180,6 +197,7 @@ cmd_stop(){
 
   case "$mode" in
     command)   do_command ;;
+    agent)     do_agent ;;
     translate) do_translate ;;
     *)         do_dictate ;;
   esac
@@ -199,28 +217,26 @@ do_dictate(){
 
   local clean=""
   if [ "$CLEANUP" != 1 ]; then clean="$raw"; log "fast mode"
-  elif ollama_up; then
+  elif llm_ready; then
     local names sys; [ -f "$DICT" ] && names=$(grep -vE '^\s*$|^#' "$DICT" | paste -sd ', ')
     sys="Clean up dictated speech. Always: remove fillers (um, uh, like, you know) and false starts/repeated words; fix grammar; add correct capitalization and punctuation; write numbers, dates, times and money normally (e.g. 'three pm' -> '3 PM', 'twenty dollars' -> '\$20', 'june twenty' -> 'June 20'). If the speech enumerates three or more items, tasks, or steps — even when phrased as a sentence with 'and' — format them as a bullet list with '- ', keeping any lead-in phrase as a heading line. If a trailing remark (such as a time, date, or note) follows the items, put it on its own line after the list, not attached to the last item. Keep a single flowing thought (not an enumeration) as prose. Keep ALL the user's real words and meaning — never summarize, drop content, translate, or explain. Output ONLY the cleaned text.$(mode_hint)"
     [ -n "${names:-}" ] && sys="$sys If a word closely matches one of these names/terms phonetically, fix it to this exact spelling: $names."
-    clean=$(curl -s --max-time 60 "$OLLAMA/api/chat" -d "$(jq -n --arg m "$GEMMA" --arg k "$KEEP_ALIVE" --arg s "$sys" --arg u "$raw" \
-      '{model:$m,think:false,stream:false,keep_alive:$k,options:{temperature:0,num_predict:400,stop:["\nInput:","Input:"]},
-        messages:[{role:"system",content:$s},
-          {role:"user",content:"um i has went to the store yesterday and buyed some stuff you know"},
-          {role:"assistant",content:"I went to the store yesterday and bought some stuff."},
-          {role:"user",content:"i need to buy milk eggs bread and coffee tomorrow"},
-          {role:"assistant",content:"I need to buy:\n- milk\n- eggs\n- bread\n- coffee\n\ntomorrow"},
-          {role:"user",content:"remember to call the bank pay rent and email john"},
-          {role:"assistant",content:"Remember to:\n- call the bank\n- pay rent\n- email John"},
-          {role:"user",content:"so i was thinking we could maybe meet tomorrow and discuss the project"},
-          {role:"assistant",content:"I was thinking we could meet tomorrow and discuss the project."},
-          {role:"user",content:"the meeting is at three pm on june twenty and it costs twenty dollars"},
-          {role:"assistant",content:"The meeting is at 3 PM on June 20, and it costs $20."},
-          {role:"user",content:$u}]}')" \
-      | jq -r '.message.content // empty' | sed 's/^ *//; s/ *$//')
+    clean=$(llm_chat_messages "$(jq -n --arg s "$sys" --arg u "$raw" \
+      '[{role:"system",content:$s},
+        {role:"user",content:"um i has went to the store yesterday and buyed some stuff you know"},
+        {role:"assistant",content:"I went to the store yesterday and bought some stuff."},
+        {role:"user",content:"i need to buy milk eggs bread and coffee tomorrow"},
+        {role:"assistant",content:"I need to buy:\n- milk\n- eggs\n- bread\n- coffee\n\ntomorrow"},
+        {role:"user",content:"remember to call the bank pay rent and email john"},
+        {role:"assistant",content:"Remember to:\n- call the bank\n- pay rent\n- email John"},
+        {role:"user",content:"so i was thinking we could maybe meet tomorrow and discuss the project"},
+        {role:"assistant",content:"I was thinking we could meet tomorrow and discuss the project."},
+        {role:"user",content:"the meeting is at three pm on june twenty and it costs twenty dollars"},
+        {role:"assistant",content:"The meeting is at 3 PM on June 20, and it costs $20."},
+        {role:"user",content:$u}]')")
   else
-    [ "$ON_OLLAMA_DOWN" = abort ] && die "Ollama not running" "start it: ollama serve"
-    notify "⚠️ Ollama down — raw text"; log "ollama down"
+    [ "$ON_OLLAMA_DOWN" = abort ] && die "Cleanup backend down" "ollama serve, or set GEMMA_BACKEND/AISTUDIO_KEY"
+    notify "⚠️ Cleanup unavailable — raw text"; log "llm not ready"
   fi
   [ -z "$clean" ] && clean="$raw"
   log "CLEAN: $clean"
@@ -235,7 +251,7 @@ do_translate(){
   [ -z "$raw" ] && { notify "Nothing heard"; exit 0; }
   is_junk "$raw" && { notify "Nothing heard"; exit 0; }
   local out=""
-  if ollama_up; then
+  if llm_ready; then
     out=$(gemma_chat "You are a translator. Translate the user's text into $TARGET_LANG. Output ONLY the translation, nothing else." "$raw")
   fi
   [ -z "$out" ] && out="$raw"
@@ -250,7 +266,7 @@ do_command(){
   log "INSTR: $instr"
   [ -z "$instr" ] && { notify "No command heard"; exit 0; }
   is_junk "$instr" && { notify "No command heard"; exit 0; }
-  ollama_up || die "Ollama not running" "command mode needs Gemma"
+  llm_ready || die "Cleanup backend down" "command mode needs Gemma (ollama or AI Studio key)"
 
   # grab the currently selected text via clipboard (save + restore)
   wl-paste -n > "$CLIPBAK" 2>/dev/null || : > "$CLIPBAK"
@@ -273,7 +289,75 @@ $seltext")
   notify "🛠️ Done" "$out"
 }
 
-# ---------- output ----------
+# ---------- agent mode (F10): voice -> one safe action ----------
+do_agent(){
+  notify "🤖 Listening…"
+  local goal; goal=$(transcribe "$LANG_CODE")
+  log "AGENT goal: $goal"
+  [ -z "$goal" ] && { notify "Nothing heard"; exit 0; }
+  is_junk "$goal" && { notify "Nothing heard"; exit 0; }
+  llm_ready || die "Agent backend down" "needs Gemma (set GEMMA_BACKEND/AISTUDIO_KEY)"
+
+  local sys="You convert a spoken command into ONE action as strict JSON. Output ONLY a JSON object {\"action\":string,\"arg\":string} and nothing else. action MUST be exactly one of: open_app (launch an application; arg = app name), web_search (search the web; arg = the search query), find_file (find files on the computer; arg = filename or keywords), none (anything else; arg = \"\")."
+  local raw_json; raw_json=$(llm_chat_messages "$(jq -n --arg s "$sys" --arg u "$goal" '[
+    {role:"system",content:$s},
+    {role:"user",content:"open firefox"},               {role:"assistant",content:"{\"action\":\"open_app\",\"arg\":\"firefox\"}"},
+    {role:"user",content:"can you launch spotify please"},{role:"assistant",content:"{\"action\":\"open_app\",\"arg\":\"spotify\"}"},
+    {role:"user",content:"search google for the weather in kozhikode"},{role:"assistant",content:"{\"action\":\"web_search\",\"arg\":\"weather in kozhikode\"}"},
+    {role:"user",content:"look up how to center a div"},  {role:"assistant",content:"{\"action\":\"web_search\",\"arg\":\"how to center a div\"}"},
+    {role:"user",content:"find my resume pdf"},          {role:"assistant",content:"{\"action\":\"find_file\",\"arg\":\"resume pdf\"}"},
+    {role:"user",content:"where are my vacation photos"}, {role:"assistant",content:"{\"action\":\"find_file\",\"arg\":\"vacation photos\"}"},
+    {role:"user",content:"what is the capital of france"},{role:"assistant",content:"{\"action\":\"none\",\"arg\":\"\"}"},
+    {role:"user",content:$u}]')")
+  # extract the JSON object even if wrapped in prose/markdown
+  local js; js=$(printf '%s' "$raw_json" | grep -oE '\{[^}]*\}' | head -1)
+  local action arg
+  action=$(printf '%s' "$js" | jq -r '.action // "none"' 2>/dev/null)
+  arg=$(printf '%s' "$js" | jq -r '.arg // ""' 2>/dev/null)
+  log "AGENT -> action=$action arg=$arg"
+  case "$action" in
+    open_app)   agent_open "$arg" ;;
+    web_search) agent_search "$arg" ;;
+    find_file)  agent_find "$arg" ;;
+    *)          notify "🤷 Can't do that yet" "$goal" ;;
+  esac
+}
+agent_open(){
+  local a cmd=""; a=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/^ *//; s/ *$//')
+  [ -f "$CONFIG_DIR/apps" ] && cmd=$(awk -F= -v k="$a" 'tolower($1)~k && $2{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$CONFIG_DIR/apps")
+  if [ -z "$cmd" ]; then case "$a" in
+    *browser*|*chrome*|*firefox*|*zen*) cmd=zen ;;
+    *code*|*editor*|*vscode*) cmd=code ;;
+    *term*|*kitty*|*console*) cmd=kitty ;;
+    *file*|*folder*|*nautilus*|*files*) cmd=nautilus ;;
+    *spotify*|*music*) cmd=spotify ;;
+    *) cmd="$a" ;;
+  esac; fi
+  notify "🚀 Opening $cmd"; log "open_app: $cmd"
+  if command -v app2unit >/dev/null 2>&1; then app2unit -- "$cmd" >/dev/null 2>&1 & 
+  else hyprctl dispatch exec -- "$cmd" >/dev/null 2>&1; fi
+}
+agent_search(){
+  [ -z "$1" ] && { notify "Nothing to search"; return; }
+  local q; q=$(jq -rn --arg s "$1" '$s|@uri')
+  notify "🔎 Searching" "$1"; log "web_search: $1"
+  xdg-open "https://www.google.com/search?q=$q" >/dev/null 2>&1 &
+}
+agent_find(){
+  [ -z "$1" ] && { notify "Nothing to find"; return; }
+  notify "📁 Searching files…"
+  local pat res; pat=$(printf '%s' "$1" | sed 's/  */.*/g')
+  if command -v fd >/dev/null 2>&1; then
+    res=$(fd -i -H -E .git -E node_modules -E .cache "$pat" "$HOME" 2>/dev/null | head -8)
+  else
+    res=$(find "$HOME" -iname "*$(printf '%s' "$1" | sed 's/  */*/g')*" -not -path '*/.*' 2>/dev/null | head -8)
+  fi
+  if [ -z "$res" ]; then notify "No files match" "$1"; log "find_file: 0 hits for $1"; return; fi
+  printf '%s\n' "$res" | wl-copy 2>/dev/null
+  log "find_file: $(printf '%s\n' "$res" | wc -l) hits for $1"
+  notify "📁 Found (paths copied)" "$(printf '%s\n' "$res" | sed "s|$HOME/||" | head -6)"
+}
+
 emit(){
   case "$PASTE_MODE" in
     stdout)    printf '%s\n' "$1" ;;
@@ -373,13 +457,13 @@ Add to ~/.config/hypr/hyprland.conf:
   exec-once = $bin warm                        # preload Parakeet + Gemma at login (no cold start)
   bind  = , F9,  exec, $bin start
   bindr = , F9,  exec, $bin stop
-  bind  = , F10, exec, $bin start command      # edit SELECTED text by voice
+  bind  = , F10, exec, $bin start agent        # voice action: open app / web search / find files
   bindr = , F10, exec, $bin stop
   bind  = , F11, exec, $bin start translate    # speak any language -> $TARGET_LANG
   bindr = , F11, exec, $bin stop
   bind  = SUPER, BackSpace, exec, $bin undo     # cancel recording, or undo last dictation
 
-Hold F9 dictate · F10 command (on selected text) · F11 translate · Super+Backspace cancel/undo.
+Hold F9 dictate · F10 agent (open app / search / find files) · F11 translate · Super+Backspace cancel/undo.
 Parakeet STT: if not installed, see README (uv venv + onnx-asr + model download).
 EOF
 }
@@ -419,7 +503,7 @@ usage: signet <command>
   undo                                cancel recording, or undo the last dictation
   history [n]                         show recent dictations
   warm | setup | doctor | status | config | version
-modes: dictate (clean+type) · command (edit selected text by voice) · translate (-> \$TARGET_LANG)
+modes: dictate (clean+type) · agent (open app/search/find files) · translate (-> \$TARGET_LANG)
 EOF
 }
 case "${1:-}" in
