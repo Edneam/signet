@@ -3,7 +3,7 @@
 # Speak, get clean text anywhere. whisper.cpp + Gemma, fully on-device.
 set -uo pipefail
 
-VERSION="0.6.2"
+VERSION="0.7.0"
 APP="signet"
 
 # ---------- XDG paths ----------
@@ -295,7 +295,7 @@ do_agent(){
     # FALLBACK: Gemma 4 (cloud) for anything the keyword router didn't catch
     llm_ready "$AGENT_BACKEND" || die "Agent backend down" "needs Gemma (set AISTUDIO_KEY)"
     notify "🤔 Thinking…"
-    local sys="You convert a spoken command into ONE action as strict JSON. Output ONLY a JSON object {\"action\":string,\"arg\":string} and nothing else. action MUST be exactly one of: open_app (launch an application; arg = app name), web_search (search the web; arg = the search query), find_file (find files on the computer; arg = filename or keywords), none (anything else; arg = \"\")."
+    local sys="You convert a spoken command into ONE action as strict JSON. Output ONLY a JSON object {\"action\":string,\"arg\":string} and nothing else. action MUST be exactly one of: open_app (launch an app; arg=app name), web_search (search the web; arg=query), find_file (find files; arg=keywords), close_app (close/quit a running app or window; arg=app name or \"this\"), focus_app (switch to/focus a running app; arg=app name), window (window/workspace control like fullscreen, minimize, next workspace, workspace 3; arg=the command), none (anything else; arg=\"\")."
     local raw_json; raw_json=$(llm_chat_messages "$AGENT_BACKEND" "$(jq -n --arg s "$sys" --arg u "$goal" '[
       {role:"system",content:$s},
       {role:"user",content:"open firefox"},{role:"assistant",content:"{\"action\":\"open_app\",\"arg\":\"firefox\"}"},
@@ -312,6 +312,9 @@ do_agent(){
     open_app)   agent_open "$arg" ;;
     web_search) agent_search "$arg" ;;
     find_file)  agent_find "$arg" ;;
+    close_app)  agent_close "$arg" ;;
+    focus_app)  agent_focus "$arg" ;;
+    window)     agent_window "$arg" ;;
     *)          notify "🤷 Can't do that yet" "$goal" ;;
   esac
 }
@@ -329,6 +332,14 @@ quick_route(){
     find\ *|locate\ *|where\ is\ *|where\ are\ *|where\ can\ i\ find\ *|open\ the\ file\ *)
       local a; a=$(printf '%s' "$g" | sed -E 's/^(find |locate |where is |where are |where can i find |open the file )//; s/^(my |the |a |an )+//; s/( on my (computer|pc|laptop|machine))$//; s/ *$//')
       [ -n "$a" ] && printf 'find_file\t%s' "$a" ;;
+    close\ *|quit\ *|kill\ *|exit\ *)
+      local a; a=$(printf '%s' "$g" | sed -E 's/^(close |quit |kill |exit )//; s/^(the |my |a |an |this )+//; s/( window| app| application)$//; s/ *$//')
+      printf 'close_app\t%s' "$a" ;;
+    fullscreen*|full\ screen*|maximize*|minimize*|next\ workspace*|previous\ workspace*|prev\ workspace*|workspace\ *|go\ to\ workspace\ *|switch\ to\ workspace\ *)
+      printf 'window\t%s' "$g" ;;
+    switch\ to\ *|focus\ *|go\ to\ *|bring\ up\ *)
+      local a; a=$(printf '%s' "$g" | sed -E 's/^(switch to |focus |go to |bring up )//; s/^(the |my |a |an )+//; s/( window| app)$//; s/ *$//')
+      [ -n "$a" ] && printf 'focus_app\t%s' "$a" ;;
     *) : ;;
   esac
 }
@@ -391,6 +402,41 @@ agent_find(){
   printf '%s\n' "$res" | wl-copy 2>/dev/null
   log "find_file: $(printf '%s\n' "$res" | wc -l) hits for $1"
   notify "📁 Found (paths copied)" "$(printf '%s\n' "$res" | sed "s|$HOME/||" | head -6)"
+}
+# resolve a spoken app name -> address of a matching RUNNING window (via hyprctl clients)
+win_addr(){
+  local want; want=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9 ]//g; s/^(my|the|a|an) //; s/^ *//; s/ *$//')
+  case "$want" in browser|web) want=$(xdg-settings get default-web-browser 2>/dev/null | sed 's/\.desktop$//') ;;
+                  terminal|console) want="kitty" ;; esac
+  hyprctl clients -j 2>/dev/null | jq -r --arg w "$want" '
+    map({a:.address, c:(.class//""|ascii_downcase), t:(.title//""|ascii_downcase), f:.focusHistoryID})
+    | map(select(.c as $c | .t as $t | ($c|contains($w)) or ($t|contains($w)) or (($c|length>1) and ($w|contains($c)))))
+    | sort_by(.f) | (.[0].a // empty)'
+}
+agent_close(){
+  case "$1" in ""|this|current|it|window|active) notify "✖ Closing window"; log "close: active"; hyprctl dispatch killactive >/dev/null 2>&1; return ;; esac
+  local addr; addr=$(win_addr "$1")
+  if [ -n "$addr" ]; then notify "✖ Closing" "$1"; log "close: $1 ($addr)"; hyprctl dispatch closewindow "address:$addr" >/dev/null 2>&1
+  else notify "🤷 Not open" "$1"; log "close: no window for $1"; fi
+}
+agent_focus(){
+  local addr; addr=$(win_addr "$1")
+  if [ -n "$addr" ]; then notify "👁 Focusing" "$1"; log "focus: $1 ($addr)"; hyprctl dispatch focuswindow "address:$addr" >/dev/null 2>&1
+  else notify "🤷 Not open" "$1"; log "focus: no window for $1"; fi
+}
+agent_window(){
+  local g="$1"
+  case "$g" in
+    *fullscreen*|*full\ screen*|*maximize*) hyprctl dispatch fullscreen 0 >/dev/null 2>&1; notify "⛶ Fullscreen" ;;
+    *minimize*)                             hyprctl dispatch movetoworkspacesilent special >/dev/null 2>&1; notify "_ Minimized" ;;
+    *next\ workspace*)                      hyprctl dispatch workspace e+1 >/dev/null 2>&1; notify "→ Next workspace" ;;
+    *previous\ workspace*|*prev\ workspace*) hyprctl dispatch workspace e-1 >/dev/null 2>&1; notify "← Prev workspace" ;;
+    *workspace\ *)
+      local n; n=$(printf '%s' "$g" | grep -oE '[0-9]+' | head -1)
+      [ -n "$n" ] && { hyprctl dispatch workspace "$n" >/dev/null 2>&1; notify "⊞ Workspace $n"; } || notify "Which workspace?" ;;
+    *) notify "🤷 Window command?" "$g" ;;
+  esac
+  log "window: $g"
 }
 
 emit(){
