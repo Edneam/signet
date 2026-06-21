@@ -3,7 +3,7 @@
 # Speak, get clean text anywhere. whisper.cpp + Gemma, fully on-device.
 set -uo pipefail
 
-VERSION="0.5.0"
+VERSION="0.6.0"
 APP="signet"
 
 # ---------- XDG paths ----------
@@ -41,16 +41,20 @@ THREADS=8
 WTYPE_DELAY=12                 # ms between keystrokes when typing directly (fixes dropped/doubled chars)
 TONE="auto"                    # legacy alias for MODE
 MODE="auto"                    # auto | default | email | message | code | notes | formal
-TARGET_LANG="English"          # translation mode target
 STT_ENGINE="parakeet"          # parakeet (fast, warm server) | whisper (whisper.cpp)
 ASR_PYTHON="$DATA_DIR/asr/bin/python"      # venv python for the Parakeet server
 ASR_MODEL_DIR="$DATA_DIR/models/parakeet-v3"
 ASR_PORT=8126
-GEMMA_BACKEND="local"          # local (ollama, offline) | aistudio (Gemma 4 via free Gemini API key)
+GEMMA_BACKEND="local"          # legacy fallback (used when per-mode backends unset)
+DICTATE_BACKEND=""             # F9 cleanup: local | aistudio  (default: local)
+AGENT_BACKEND=""               # F10 agent:  local | aistudio  (default: aistudio)
 AISTUDIO_KEY=""                # free key from aistudio.google.com/apikey (put in config, NOT in repo)
-AISTUDIO_MODEL="gemma-4-26b-a4b-it"  # gemma-4-26b-a4b-it (fast MoE) or gemma-4-31b-it
+AISTUDIO_MODEL="gemma-4-26b-a4b-it"  # fast MoE (~4B active); plenty for routing + cleanup
 AISTUDIO_URL="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 [ -f "$CONFIG" ] && . "$CONFIG"
+# per-mode backend defaults (fall back to GEMMA_BACKEND, then sensible defaults)
+DICTATE_BACKEND="${DICTATE_BACKEND:-${GEMMA_BACKEND:-local}}"
+AGENT_BACKEND="${AGENT_BACKEND:-aistudio}"
 # back-compat: honor old TONE setting if MODE wasn't customized
 [ "${MODE:-auto}" = auto ] && [ "${TONE:-auto}" != auto ] && MODE="$TONE"
 # resolve the Parakeet server script next to this binary (repo or /usr/bin)
@@ -85,14 +89,15 @@ asr_ensure(){ # start the warm Parakeet server if not already running
   for _ in $(seq 1 60); do asr_up && { log "parakeet up"; return 0; }; sleep 0.5; done
   log "parakeet failed to start"; return 1
 }
-warm_bg(){ ( curl -s --max-time 30 "$OLLAMA/api/generate" -d "$(jq -n --arg m "$GEMMA" --arg k "$KEEP_ALIVE" '{model:$m,prompt:"",stream:false,think:false,keep_alive:$k}')" >/dev/null 2>&1 & ); [ "$STT_ENGINE" = parakeet ] && ( asr_ensure & ); }
+warm_bg(){ [ "$DICTATE_BACKEND" = local ] || [ "$AGENT_BACKEND" = local ] && ( curl -s --max-time 30 "$OLLAMA/api/generate" -d "$(jq -n --arg m "$GEMMA" --arg k "$KEEP_ALIVE" '{model:$m,prompt:"",stream:false,think:false,keep_alive:$k}')" >/dev/null 2>&1 & ); [ "$STT_ENGINE" = parakeet ] && ( asr_ensure & ); return 0; }
 [ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null||echo 0)" -gt 1048576 ] && mv "$LOG" "$LOG.1"
 
-# call Gemma chat: $1=system $2=user -> stdout (empty on failure)
-llm_ready(){ if [ "$GEMMA_BACKEND" = aistudio ]; then [ -n "$AISTUDIO_KEY" ]; else ollama_up; fi; }
-llm_chat_messages(){ # $1 = JSON array of chat messages -> cleaned content on stdout
-  local msgs="$1"
-  if [ "$GEMMA_BACKEND" = aistudio ] && [ -n "$AISTUDIO_KEY" ]; then
+# $1 = backend (local|aistudio)
+llm_ready(){ if [ "$1" = aistudio ]; then [ -n "$AISTUDIO_KEY" ]; else ollama_up; fi; }
+# llm_chat_messages <backend> <messages-json> -> content
+llm_chat_messages(){
+  local backend="$1" msgs="$2"
+  if [ "$backend" = aistudio ] && [ -n "$AISTUDIO_KEY" ]; then
     curl -s --max-time 60 "$AISTUDIO_URL" -H "Authorization: Bearer $AISTUDIO_KEY" -H "Content-Type: application/json" \
       -d "$(jq -n --arg m "$AISTUDIO_MODEL" --argjson msgs "$msgs" '{model:$m,temperature:0,messages:$msgs}')" \
       | jq -r '.choices[0].message.content // empty' \
@@ -104,8 +109,8 @@ llm_chat_messages(){ # $1 = JSON array of chat messages -> cleaned content on st
       | jq -r '.message.content // empty' | sed 's/^ *//; s/ *$//'
   fi
 }
-gemma_chat(){ # $1 system $2 user -> content (routes local/cloud)
-  llm_chat_messages "$(jq -n --arg s "$1" --arg u "$2" '[{role:"system",content:$s},{role:"user",content:$u}]')"
+gemma_chat(){ # $1 backend $2 system $3 user -> content
+  llm_chat_messages "$1" "$(jq -n --arg s "$2" --arg u "$3" '[{role:"system",content:$s},{role:"user",content:$u}]')"
 }
 
 mode_hint(){ # per-context guidance appended to the cleanup prompt; auto from active window
@@ -139,7 +144,6 @@ cmd_start(){
   case "${1:-dictate}" in
     command)   notify "🛠️  Command…" ;;
     agent)     notify "🤖 Agent…" ;;
-    translate) notify "🌐 Translate…" ;;
     *)         notify "🎤 Recording…" ;;
   esac
   blip start
@@ -198,7 +202,6 @@ cmd_stop(){
   case "$mode" in
     command)   do_command ;;
     agent)     do_agent ;;
-    translate) do_translate ;;
     *)         do_dictate ;;
   esac
 }
@@ -217,11 +220,11 @@ do_dictate(){
 
   local clean=""
   if [ "$CLEANUP" != 1 ]; then clean="$raw"; log "fast mode"
-  elif llm_ready; then
+  elif llm_ready "$DICTATE_BACKEND"; then
     local names sys; [ -f "$DICT" ] && names=$(grep -vE '^\s*$|^#' "$DICT" | paste -sd ', ')
     sys="Clean up dictated speech. Always: remove fillers (um, uh, like, you know) and false starts/repeated words; fix grammar; add correct capitalization and punctuation; write numbers, dates, times and money normally (e.g. 'three pm' -> '3 PM', 'twenty dollars' -> '\$20', 'june twenty' -> 'June 20'). If the speech enumerates three or more items, tasks, or steps — even when phrased as a sentence with 'and' — format them as a bullet list with '- ', keeping any lead-in phrase as a heading line. If a trailing remark (such as a time, date, or note) follows the items, put it on its own line after the list, not attached to the last item. Keep a single flowing thought (not an enumeration) as prose. Keep ALL the user's real words and meaning — never summarize, drop content, translate, or explain. Output ONLY the cleaned text.$(mode_hint)"
     [ -n "${names:-}" ] && sys="$sys If a word closely matches one of these names/terms phonetically, fix it to this exact spelling: $names."
-    clean=$(llm_chat_messages "$(jq -n --arg s "$sys" --arg u "$raw" \
+    clean=$(llm_chat_messages "$DICTATE_BACKEND" "$(jq -n --arg s "$sys" --arg u "$raw" \
       '[{role:"system",content:$s},
         {role:"user",content:"um i has went to the store yesterday and buyed some stuff you know"},
         {role:"assistant",content:"I went to the store yesterday and bought some stuff."},
@@ -244,21 +247,6 @@ do_dictate(){
   notify "✅ Done" "$clean"
 }
 
-do_translate(){
-  notify "🌐 Translating…"
-  local raw; raw=$(transcribe auto)
-  log "RAW(xl): $raw"
-  [ -z "$raw" ] && { notify "Nothing heard"; exit 0; }
-  is_junk "$raw" && { notify "Nothing heard"; exit 0; }
-  local out=""
-  if llm_ready; then
-    out=$(gemma_chat "You are a translator. Translate the user's text into $TARGET_LANG. Output ONLY the translation, nothing else." "$raw")
-  fi
-  [ -z "$out" ] && out="$raw"
-  log "TRANSLATED: $out"
-  emit "$out"
-  notify "🌐 $TARGET_LANG" "$out"
-}
 
 do_command(){
   notify "🛠️  Reading command…"
@@ -266,7 +254,7 @@ do_command(){
   log "INSTR: $instr"
   [ -z "$instr" ] && { notify "No command heard"; exit 0; }
   is_junk "$instr" && { notify "No command heard"; exit 0; }
-  llm_ready || die "Cleanup backend down" "command mode needs Gemma (ollama or AI Studio key)"
+  llm_ready "$AGENT_BACKEND" || die "Cleanup backend down" "command mode needs Gemma (ollama or AI Studio key)"
 
   # grab the currently selected text via clipboard (save + restore)
   wl-paste -n > "$CLIPBAK" 2>/dev/null || : > "$CLIPBAK"
@@ -276,7 +264,7 @@ do_command(){
     notify "Select text first" "command mode edits selected text"; log "command: no selection"
     [ -s "$CLIPBAK" ] && wl-copy < "$CLIPBAK"; return
   fi
-  local out; out=$(gemma_chat "Apply the user's instruction to their text. Output ONLY the resulting text, nothing else — no preamble, no quotes." "Instruction: $instr
+  local out; out=$(gemma_chat "$AGENT_BACKEND" "Apply the user's instruction to their text. Output ONLY the resulting text, nothing else — no preamble, no quotes." "Instruction: $instr
 
 Text:
 $seltext")
@@ -296,10 +284,10 @@ do_agent(){
   log "AGENT goal: $goal"
   [ -z "$goal" ] && { notify "Nothing heard"; exit 0; }
   is_junk "$goal" && { notify "Nothing heard"; exit 0; }
-  llm_ready || die "Agent backend down" "needs Gemma (set GEMMA_BACKEND/AISTUDIO_KEY)"
+  llm_ready "$AGENT_BACKEND" || die "Agent backend down" "needs Gemma (set GEMMA_BACKEND/AISTUDIO_KEY)"
 
   local sys="You convert a spoken command into ONE action as strict JSON. Output ONLY a JSON object {\"action\":string,\"arg\":string} and nothing else. action MUST be exactly one of: open_app (launch an application; arg = app name), web_search (search the web; arg = the search query), find_file (find files on the computer; arg = filename or keywords), none (anything else; arg = \"\")."
-  local raw_json; raw_json=$(llm_chat_messages "$(jq -n --arg s "$sys" --arg u "$goal" '[
+  local raw_json; raw_json=$(llm_chat_messages "$AGENT_BACKEND" "$(jq -n --arg s "$sys" --arg u "$goal" '[
     {role:"system",content:$s},
     {role:"user",content:"open firefox"},               {role:"assistant",content:"{\"action\":\"open_app\",\"arg\":\"firefox\"}"},
     {role:"user",content:"can you launch spotify please"},{role:"assistant",content:"{\"action\":\"open_app\",\"arg\":\"spotify\"}"},
@@ -413,7 +401,9 @@ cmd_undo(){ # Super+Backspace: cancel if recording, else undo last dictation (si
 cmd_history(){ [ -f "$HIST" ] && tail -n "${1:-10}" "$HIST" || echo "(no history)"; }
 cmd_warm(){
   [ "$STT_ENGINE" = parakeet ] && { asr_ensure && echo "parakeet warm" || echo "parakeet warm failed"; }
-  curl -s --max-time 90 "$OLLAMA/api/generate" -d "$(jq -n --arg m "$GEMMA" --arg k "$KEEP_ALIVE" '{model:$m,prompt:"hi",stream:false,think:false,keep_alive:$k}')" >/dev/null 2>&1 && echo "warmed $GEMMA" || echo "gemma warm failed"
+  if [ "$DICTATE_BACKEND" = local ] || [ "$AGENT_BACKEND" = local ]; then
+    curl -s --max-time 90 "$OLLAMA/api/generate" -d "$(jq -n --arg m "$GEMMA" --arg k "$KEEP_ALIVE" '{model:$m,prompt:"hi",stream:false,think:false,keep_alive:$k}')" >/dev/null 2>&1 && echo "warmed $GEMMA (local)" || echo "gemma warm failed"
+  else echo "cloud backend — no local warm needed"; fi
 }
 
 ok(){ printf '  \033[32m✓\033[0m %s\n' "$1"; }
@@ -431,9 +421,16 @@ cmd_doctor(){
   fi
   echo "whisper (fallback):"; [ -x "$WHISPER" ] && ok "$WHISPER" || echo "  - whisper-cli not found"
   [ -n "$MODEL" ] && [ -f "$MODEL" ] && ok "model: $MODEL" || echo "  - no whisper model"
-  echo "ollama:"
-  if ollama_up; then ok "running"; curl -s "$OLLAMA/api/tags" | jq -e --arg g "$GEMMA" '.models[]?.name|select(.==$g)' >/dev/null 2>&1 && ok "$GEMMA pulled" || bad "$GEMMA not pulled — ollama pull $GEMMA"
-  else bad "not running — ollama serve"; fi
+  echo "brain: dictate=$DICTATE_BACKEND  agent=$AGENT_BACKEND"
+  if [ "$DICTATE_BACKEND" = local ] || [ "$AGENT_BACKEND" = local ]; then
+    echo "ollama (local backend):"
+    if ollama_up; then ok "running"; curl -s "$OLLAMA/api/tags" | jq -e --arg g "$GEMMA" '.models[]?.name|select(.==$g)' >/dev/null 2>&1 && ok "$GEMMA pulled" || bad "$GEMMA not pulled — ollama pull $GEMMA"
+    else bad "not running — ollama serve"; fi
+  fi
+  if [ "$DICTATE_BACKEND" = aistudio ] || [ "$AGENT_BACKEND" = aistudio ]; then
+    echo "AI Studio (cloud backend):"
+    [ -n "$AISTUDIO_KEY" ] && ok "key set (model $AISTUDIO_MODEL)" || bad "AISTUDIO_KEY missing in config"
+  fi
   echo "mic:"; have wpctl && { case "$(wpctl get-volume @DEFAULT_AUDIO_SOURCE@ 2>/dev/null)" in *MUTED*) bad "mic MUTED — signet setup";; *) ok "$(wpctl get-volume @DEFAULT_AUDIO_SOURCE@ 2>/dev/null)";; esac; }
   echo "config: $CONFIG"
   [ "$FAILED" = 0 ] && echo "All good." || return 1
@@ -459,11 +456,9 @@ Add to ~/.config/hypr/hyprland.conf:
   bindr = , F9,  exec, $bin stop
   bind  = , F10, exec, $bin start agent        # voice action: open app / web search / find files
   bindr = , F10, exec, $bin stop
-  bind  = , F11, exec, $bin start translate    # speak any language -> $TARGET_LANG
-  bindr = , F11, exec, $bin stop
   bind  = SUPER, BackSpace, exec, $bin undo     # cancel recording, or undo last dictation
 
-Hold F9 dictate · F10 agent (open app / search / find files) · F11 translate · Super+Backspace cancel/undo.
+Hold F9 dictate · F10 agent (open app / search / find files) · Super+Backspace cancel/undo.
 Parakeet STT: if not installed, see README (uv venv + onnx-asr + model download).
 EOF
 }
@@ -475,11 +470,15 @@ ASR_MODEL_DIR="$DATA_DIR/models/parakeet-v3"
 ASR_PORT=8126
 GEMMA="gemma4:e2b"
 KEEP_ALIVE="30m"          # keep Gemma warm (memory vs cold-reload speed); "-1" = never unload
+# per-mode brain backend: local (e2b, offline/private) | aistudio (cloud Gemma 4, needs key)
+DICTATE_BACKEND="local"   # F9 dictation
+AGENT_BACKEND="aistudio"  # F10 agent (open app / search / find files)
+# AISTUDIO_KEY="..."      # free key from aistudio.google.com/apikey (needed for cloud backends)
+AISTUDIO_MODEL="gemma-4-26b-a4b-it"
 LANG_CODE="en"
 PASTE_MODE="auto"         # auto | paste | clipboard | stdout
 CLEANUP=1                 # 1 = Gemma polish ; 0 = fast (whisper/parakeet only, ~half time)
 MODE="auto"               # auto (pick from active window) | default | email | message | code | notes | formal
-TARGET_LANG="English"     # translate mode target
 SOUND=1
 WTYPE_DELAY=12            # ms between keys when typing directly
 MIC="@DEFAULT_AUDIO_SOURCE@"
@@ -490,20 +489,20 @@ EOF
 cmd_status(){
   echo "signet v$VERSION"; echo "whisper: $WHISPER"; echo "model:   ${MODEL:-<none>}"
   echo "gemma:   $GEMMA (keep_alive=$KEEP_ALIVE)  cleanup:$CLEANUP  mode:$MODE"
-  echo "paste:   $PASTE_MODE  sound:$SOUND  typedelay:$WTYPE_DELAY  lang:$LANG_CODE  target:$TARGET_LANG"
+  echo "paste:   $PASTE_MODE  sound:$SOUND  typedelay:$WTYPE_DELAY  lang:$LANG_CODE"
   echo "recording:$([ -f "$PIDFILE" ] && echo ' active' || echo ' idle')"
   echo "--- log ---"; tail -n 8 "$LOG" 2>/dev/null
 }
 usage(){ cat <<EOF
 signet v$VERSION — local voice dictation + AI commands (Hyprland)
 usage: signet <command>
-  start [dictate|command|translate]   begin recording (bind to key press)
+  start [dictate|command|agent]   begin recording (bind to key press)
   stop                                stop + process (bind to key release)
   toggle [mode]                       start/stop on one tap
   undo                                cancel recording, or undo the last dictation
   history [n]                         show recent dictations
   warm | setup | doctor | status | config | version
-modes: dictate (clean+type) · agent (open app/search/find files) · translate (-> \$TARGET_LANG)
+modes: dictate (clean+type) · agent (open app/search/find files)
 EOF
 }
 case "${1:-}" in
