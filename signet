@@ -3,7 +3,7 @@
 # Speak, get clean text anywhere. whisper.cpp + Gemma, fully on-device.
 set -uo pipefail
 
-VERSION="0.7.0"
+VERSION="0.8.0"
 APP="signet"
 
 # ---------- XDG paths ----------
@@ -48,6 +48,7 @@ ASR_PORT=8126
 GEMMA_BACKEND="local"          # legacy fallback (used when per-mode backends unset)
 DICTATE_BACKEND=""             # F9 cleanup: local | aistudio  (default: local)
 AGENT_BACKEND=""               # F10 agent:  local | aistudio  (default: aistudio)
+AGENT_ALLOW_POWER=0            # 1 = allow voice shutdown/reboot/logout (default off, safety)
 AISTUDIO_KEY=""                # free key from aistudio.google.com/apikey (put in config, NOT in repo)
 AISTUDIO_MODEL="gemma-4-26b-a4b-it"  # fast MoE (~4B active); plenty for routing + cleanup
 AISTUDIO_URL="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
@@ -295,7 +296,7 @@ do_agent(){
     # FALLBACK: Gemma 4 (cloud) for anything the keyword router didn't catch
     llm_ready "$AGENT_BACKEND" || die "Agent backend down" "needs Gemma (set AISTUDIO_KEY)"
     notify "🤔 Thinking…"
-    local sys="You convert a spoken command into ONE action as strict JSON. Output ONLY a JSON object {\"action\":string,\"arg\":string} and nothing else. action MUST be exactly one of: open_app (launch an app; arg=app name), web_search (search the web; arg=query), find_file (find files; arg=keywords), close_app (close/quit a running app or window; arg=app name or \"this\"), focus_app (switch to/focus a running app; arg=app name), window (window/workspace control like fullscreen, minimize, next workspace, workspace 3; arg=the command), none (anything else; arg=\"\")."
+    local sys="You convert a spoken command into ONE action as strict JSON. Output ONLY a JSON object {\"action\":string,\"arg\":string} and nothing else. action MUST be exactly one of: open_app (launch an app; arg=app name), web_search (search the web; arg=query), find_file (find files; arg=keywords), close_app (close/quit a running app or window; arg=app name or \"this\"), focus_app (switch to/focus a running app; arg=app name), window (window/workspace control like fullscreen, minimize, next workspace, workspace 3; arg=the command), media (control music/video playback; arg=one of playpause, next, prev, stop), screenshot (take a screenshot; arg=\"\"), lock (lock the screen; arg=\"\"), none (anything else; arg=\"\")."
     local raw_json; raw_json=$(llm_chat_messages "$AGENT_BACKEND" "$(jq -n --arg s "$sys" --arg u "$goal" '[
       {role:"system",content:$s},
       {role:"user",content:"open firefox"},{role:"assistant",content:"{\"action\":\"open_app\",\"arg\":\"firefox\"}"},
@@ -315,6 +316,9 @@ do_agent(){
     close_app)  agent_close "$arg" ;;
     focus_app)  agent_focus "$arg" ;;
     window)     agent_window "$arg" ;;
+    media)      agent_media "$arg" ;;
+    screenshot) agent_screenshot ;;
+    lock)       agent_lock ;;
     *)          notify "🤷 Can't do that yet" "$goal" ;;
   esac
 }
@@ -323,6 +327,18 @@ quick_route(){
   local g; g=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/^ *//; s/ *$//; s/[.?!]*$//')
   g=$(printf '%s' "$g" | sed -E 's/^(hey |ok |okay |please |can you |could you |would you |i want to |i wanna |i need to |i would like to )+//g')
   case "$g" in
+    play|play\ music|resume|resume\ music|pause|pause\ music|pause\ the\ music|play\ the\ music|unpause)
+      printf 'media\tplaypause' ;;
+    next\ song*|next\ track*|skip\ song*|skip\ track*|skip|next\ music*)
+      printf 'media\tnext' ;;
+    previous\ song*|previous\ track*|prev\ song*|last\ song*|go\ back\ a\ song*)
+      printf 'media\tprev' ;;
+    stop\ music*|stop\ the\ music*|stop\ playback*)
+      printf 'media\tstop' ;;
+    screenshot*|take\ a\ screenshot*|take\ screenshot*|capture\ screen*|screen\ shot*|grab\ a\ screenshot*)
+      printf 'screenshot\t' ;;
+    lock|lock\ screen|lock\ the\ screen|lock\ my\ screen|lock\ the\ computer|lock\ it)
+      printf 'lock\t' ;;
     open\ *|launch\ *|start\ *|run\ *)
       local a=${g#* }; a=$(printf '%s' "$a" | sed -E 's/^(the |my |a |an |app )+//; s/( app| application)$//; s/ *$//')
       [ -n "$a" ] && printf 'open_app\t%s' "$a" ;;
@@ -438,7 +454,30 @@ agent_window(){
   esac
   log "window: $g"
 }
-
+agent_media(){
+  command -v playerctl >/dev/null || { notify "playerctl not installed"; return; }
+  case "$1" in
+    next) playerctl next 2>/dev/null; notify "⏭ Next" ;;
+    prev) playerctl previous 2>/dev/null; notify "⏮ Previous" ;;
+    stop) playerctl stop 2>/dev/null; notify "⏹ Stopped" ;;
+    *)    playerctl play-pause 2>/dev/null; notify "⏯ Play/Pause" "$(playerctl metadata --format '{{title}} — {{artist}}' 2>/dev/null)" ;;
+  esac
+  log "media: ${1:-playpause}"
+}
+agent_screenshot(){
+  notify "📸 Screenshot"
+  if command -v caelestia >/dev/null 2>&1; then caelestia screenshot >/dev/null 2>&1 &
+  elif command -v grim >/dev/null 2>&1 && command -v slurp >/dev/null 2>&1; then
+    local out="$HOME/Pictures/screenshot-$(date +%Y%m%d-%H%M%S).png"; mkdir -p "$HOME/Pictures"
+    grim -g "$(slurp)" "$out" 2>/dev/null && wl-copy < "$out" 2>/dev/null && notify "📸 Saved + copied" "$out"
+  else notify "no screenshot tool"; fi
+  log "screenshot"
+}
+agent_lock(){
+  notify "🔒 Locking"
+  loginctl lock-session 2>/dev/null || hyprctl dispatch global caelestia:lock 2>/dev/null || hyprlock >/dev/null 2>&1 &
+  log "lock"
+}
 emit(){
   case "$PASTE_MODE" in
     stdout)    printf '%s\n' "$1" ;;
