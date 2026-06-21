@@ -3,7 +3,7 @@
 # Speak, get clean text anywhere. whisper.cpp + Gemma, fully on-device.
 set -uo pipefail
 
-VERSION="0.6.0"
+VERSION="0.6.1"
 APP="signet"
 
 # ---------- XDG paths ----------
@@ -284,30 +284,52 @@ do_agent(){
   log "AGENT goal: $goal"
   [ -z "$goal" ] && { notify "Nothing heard"; exit 0; }
   is_junk "$goal" && { notify "Nothing heard"; exit 0; }
-  llm_ready "$AGENT_BACKEND" || die "Agent backend down" "needs Gemma (set GEMMA_BACKEND/AISTUDIO_KEY)"
 
-  local sys="You convert a spoken command into ONE action as strict JSON. Output ONLY a JSON object {\"action\":string,\"arg\":string} and nothing else. action MUST be exactly one of: open_app (launch an application; arg = app name), web_search (search the web; arg = the search query), find_file (find files on the computer; arg = filename or keywords), none (anything else; arg = \"\")."
-  local raw_json; raw_json=$(llm_chat_messages "$AGENT_BACKEND" "$(jq -n --arg s "$sys" --arg u "$goal" '[
-    {role:"system",content:$s},
-    {role:"user",content:"open firefox"},               {role:"assistant",content:"{\"action\":\"open_app\",\"arg\":\"firefox\"}"},
-    {role:"user",content:"can you launch spotify please"},{role:"assistant",content:"{\"action\":\"open_app\",\"arg\":\"spotify\"}"},
-    {role:"user",content:"search google for the weather in kozhikode"},{role:"assistant",content:"{\"action\":\"web_search\",\"arg\":\"weather in kozhikode\"}"},
-    {role:"user",content:"look up how to center a div"},  {role:"assistant",content:"{\"action\":\"web_search\",\"arg\":\"how to center a div\"}"},
-    {role:"user",content:"find my resume pdf"},          {role:"assistant",content:"{\"action\":\"find_file\",\"arg\":\"resume pdf\"}"},
-    {role:"user",content:"where are my vacation photos"}, {role:"assistant",content:"{\"action\":\"find_file\",\"arg\":\"vacation photos\"}"},
-    {role:"user",content:"what is the capital of france"},{role:"assistant",content:"{\"action\":\"none\",\"arg\":\"\"}"},
-    {role:"user",content:$u}]')")
-  # extract the JSON object even if wrapped in prose/markdown
-  local js; js=$(printf '%s' "$raw_json" | grep -oE '\{[^}]*\}' | head -1)
-  local action arg
-  action=$(printf '%s' "$js" | jq -r '.action // "none"' 2>/dev/null)
-  arg=$(printf '%s' "$js" | jq -r '.arg // ""' 2>/dev/null)
-  log "AGENT -> action=$action arg=$arg"
+  local action="" arg=""
+  # FAST PATH: instant local keyword routing for common phrasings (no LLM, no network)
+  local qr; qr=$(quick_route "$goal")
+  if [ -n "$qr" ]; then
+    action=${qr%%	*}; arg=${qr#*	}
+    log "AGENT quick-route -> $action / $arg"
+  else
+    # FALLBACK: Gemma 4 (cloud) for anything the keyword router didn't catch
+    llm_ready "$AGENT_BACKEND" || die "Agent backend down" "needs Gemma (set AISTUDIO_KEY)"
+    notify "🤔 Thinking…"
+    local sys="You convert a spoken command into ONE action as strict JSON. Output ONLY a JSON object {\"action\":string,\"arg\":string} and nothing else. action MUST be exactly one of: open_app (launch an application; arg = app name), web_search (search the web; arg = the search query), find_file (find files on the computer; arg = filename or keywords), none (anything else; arg = \"\")."
+    local raw_json; raw_json=$(llm_chat_messages "$AGENT_BACKEND" "$(jq -n --arg s "$sys" --arg u "$goal" '[
+      {role:"system",content:$s},
+      {role:"user",content:"open firefox"},{role:"assistant",content:"{\"action\":\"open_app\",\"arg\":\"firefox\"}"},
+      {role:"user",content:"search google for the weather in kozhikode"},{role:"assistant",content:"{\"action\":\"web_search\",\"arg\":\"weather in kozhikode\"}"},
+      {role:"user",content:"find my resume pdf"},{role:"assistant",content:"{\"action\":\"find_file\",\"arg\":\"resume pdf\"}"},
+      {role:"user",content:"what is the capital of france"},{role:"assistant",content:"{\"action\":\"none\",\"arg\":\"\"}"},
+      {role:"user",content:$u}]')")
+    local js; js=$(printf '%s' "$raw_json" | grep -oE '\{[^}]*\}' | head -1)
+    action=$(printf '%s' "$js" | jq -r '.action // "none"' 2>/dev/null)
+    arg=$(printf '%s' "$js" | jq -r '.arg // ""' 2>/dev/null)
+    log "AGENT gemma -> action=$action arg=$arg"
+  fi
   case "$action" in
     open_app)   agent_open "$arg" ;;
     web_search) agent_search "$arg" ;;
     find_file)  agent_find "$arg" ;;
     *)          notify "🤷 Can't do that yet" "$goal" ;;
+  esac
+}
+# instant keyword router: echoes "action<TAB>arg" or nothing (then Gemma decides)
+quick_route(){
+  local g; g=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/^ *//; s/ *$//; s/[.?!]*$//')
+  g=$(printf '%s' "$g" | sed -E 's/^(hey |ok |okay |please |can you |could you |would you |i want to |i wanna |i need to |i would like to )+//g')
+  case "$g" in
+    open\ *|launch\ *|start\ *|run\ *)
+      local a=${g#* }; a=$(printf '%s' "$a" | sed -E 's/^(the |my |a |an |app )+//; s/( app| application)$//; s/ *$//')
+      [ -n "$a" ] && printf 'open_app\t%s' "$a" ;;
+    search\ google\ for\ *|google\ for\ *|search\ for\ *|google\ *|search\ *|look\ up\ *)
+      local a; a=$(printf '%s' "$g" | sed -E 's/^(search google for |google for |search for |google |search |look up )//; s/ *$//')
+      [ -n "$a" ] && printf 'web_search\t%s' "$a" ;;
+    find\ *|locate\ *|where\ is\ *|where\ are\ *|where\ can\ i\ find\ *)
+      local a; a=$(printf '%s' "$g" | sed -E 's/^(find |locate |where is |where are |where can i find )//; s/^(my |the |a |an )+//; s/( on my (computer|pc|laptop|machine))$//; s/ *$//')
+      [ -n "$a" ] && printf 'find_file\t%s' "$a" ;;
+    *) : ;;
   esac
 }
 agent_open(){
