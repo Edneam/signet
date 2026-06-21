@@ -3,7 +3,7 @@
 # Speak, get clean text anywhere. whisper.cpp + Gemma, fully on-device.
 set -uo pipefail
 
-VERSION="0.2.0"
+VERSION="0.5.0"
 APP="signet"
 
 # ---------- XDG paths ----------
