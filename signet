@@ -3,7 +3,7 @@
 # Speak, get clean text anywhere. whisper.cpp + Gemma, fully on-device.
 set -uo pipefail
 
-VERSION="0.6.1"
+VERSION="0.6.2"
 APP="signet"
 
 # ---------- XDG paths ----------
@@ -323,29 +323,54 @@ quick_route(){
     open\ *|launch\ *|start\ *|run\ *)
       local a=${g#* }; a=$(printf '%s' "$a" | sed -E 's/^(the |my |a |an |app )+//; s/( app| application)$//; s/ *$//')
       [ -n "$a" ] && printf 'open_app\t%s' "$a" ;;
-    search\ google\ for\ *|google\ for\ *|search\ for\ *|google\ *|search\ *|look\ up\ *)
-      local a; a=$(printf '%s' "$g" | sed -E 's/^(search google for |google for |search for |google |search |look up )//; s/ *$//')
+    search\ google\ for\ *|google\ for\ *|google\ *|look\ up\ *|look\ for\ *|search\ the\ web\ for\ *|search\ the\ web\ *|search\ online\ for\ *)
+      local a; a=$(printf '%s' "$g" | sed -E 's/^(search google for |google for |google |look up |look for |search the web for |search the web |search online for )//; s/ *$//')
       [ -n "$a" ] && printf 'web_search\t%s' "$a" ;;
-    find\ *|locate\ *|where\ is\ *|where\ are\ *|where\ can\ i\ find\ *)
-      local a; a=$(printf '%s' "$g" | sed -E 's/^(find |locate |where is |where are |where can i find )//; s/^(my |the |a |an )+//; s/( on my (computer|pc|laptop|machine))$//; s/ *$//')
+    find\ *|locate\ *|where\ is\ *|where\ are\ *|where\ can\ i\ find\ *|open\ the\ file\ *)
+      local a; a=$(printf '%s' "$g" | sed -E 's/^(find |locate |where is |where are |where can i find |open the file )//; s/^(my |the |a |an )+//; s/( on my (computer|pc|laptop|machine))$//; s/ *$//')
       [ -n "$a" ] && printf 'find_file\t%s' "$a" ;;
     *) : ;;
   esac
 }
 agent_open(){
-  local a cmd=""; a=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/^ *//; s/ *$//')
-  [ -f "$CONFIG_DIR/apps" ] && cmd=$(awk -F= -v k="$a" 'tolower($1)~k && $2{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$CONFIG_DIR/apps")
-  if [ -z "$cmd" ]; then case "$a" in
-    *browser*|*chrome*|*firefox*|*zen*) cmd=zen ;;
-    *code*|*editor*|*vscode*) cmd=code ;;
-    *term*|*kitty*|*console*) cmd=kitty ;;
-    *file*|*folder*|*nautilus*|*files*) cmd=nautilus ;;
-    *spotify*|*music*) cmd=spotify ;;
-    *) cmd="$a" ;;
-  esac; fi
-  notify "🚀 Opening $cmd"; log "open_app: $cmd"
-  if command -v app2unit >/dev/null 2>&1; then app2unit -- "$cmd" >/dev/null 2>&1 & 
-  else hyprctl dispatch exec -- "$cmd" >/dev/null 2>&1; fi
+  local want; want=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9 ]//g; s/  */ /g; s/^ *//; s/ *$//; s/^(my|the|a|an) //')
+  [ -z "$want" ] && { notify "Open what?"; return; }
+  # user alias map (~/.config/signet/apps : name = command/app)
+  local cmd=""
+  [ -f "$CONFIG_DIR/apps" ] && cmd=$(awk -F= -v k="$want" 'tolower($1)~k && $2{gsub(/^[ \t]+|[ \t]+$/,"",$2);print $2;exit}' "$CONFIG_DIR/apps")
+  if [ -n "$cmd" ]; then notify "🚀 $cmd"; log "open_app alias: $cmd"; app2unit -- $cmd >/dev/null 2>&1 & return; fi
+  # generic words -> your actual system defaults (not hardcoded)
+  case "$want" in
+    browser|web|internet|web\ browser)
+      want=$(xdg-settings get default-web-browser 2>/dev/null | sed 's/\.desktop$//'); [ -z "$want" ] && want=zen ;;
+    terminal|console|shell)
+      want=$(grep -m1 '\$terminal' "$HOME/.config/hypr/variables.conf" 2>/dev/null | sed -E 's/.*=[[:space:]]*//'); [ -z "$want" ] && want=kitty ;;
+    files|file\ manager|folder|file\ explorer) want="files nautilus" ;;
+    editor|ide|code) want="${EDITOR:-${VISUAL:-antigravity code}}" ;;
+    music|player) want="spotify" ;;
+  esac
+  # fuzzy-match against installed desktop entries -> desktop id
+  local best; best=$(
+    for d in /usr/share/applications "$HOME/.local/share/applications" /var/lib/flatpak/exports/share/applications; do
+      [ -d "$d" ] || continue
+      for f in "$d"/*.desktop; do
+        [ -f "$f" ] || continue
+        grep -qi '^NoDisplay=true' "$f" && continue
+        printf '%s\t%s\n' "$(basename "$f" .desktop)" "$(grep -m1 '^Name=' "$f" | cut -d= -f2- | tr '[:upper:]' '[:lower:]')"
+      done
+    done | awk -F'\t' -v want="$want" '
+      BEGIN{ wsq=want; gsub(/ /,"",wsq); n=split(want,wt," ") }
+      { id=$1; name=$2; nn=name; gsub(/ /,"",nn); idn=tolower(id); gsub(/[^a-z0-9]/,"",idn);
+        s=0;
+        if(nn==wsq||idn==wsq) s=100;
+        else if(length(wsq)>2 && (index(nn,wsq)||index(idn,wsq))) s=80;
+        else if(length(nn)>2 && index(wsq,nn)) s=70;
+        else { ov=0; for(i=1;i<=n;i++){t=wt[i]; if(length(t)>=4 && (index(nn,t)||index(idn,t))) ov++}; if(ov>0) s=40+ov*10 }
+        if(s>bs){bs=s; best=id} }
+      END{ if(bs>0) print best }'
+  )
+  if [ -n "$best" ]; then notify "🚀 Opening" "$best"; log "open_app: gtk-launch $best (from '$1')"; gtk-launch "$best" >/dev/null 2>&1 &
+  else notify "🤷 No app matching" "$1"; log "open_app: no match for '$1'"; fi
 }
 agent_search(){
   [ -z "$1" ] && { notify "Nothing to search"; return; }
